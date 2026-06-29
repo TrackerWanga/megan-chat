@@ -1,0 +1,22 @@
+name = "megan-chat"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+[[durable_objects.bindings]]
+name = "CHAT_ROOM"
+class_name = "ChatRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ChatRoom"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "megan-chat-db"
+database_id = "2a65b5c4-0439-4ffe-9d52-4b986a0afb03"
+
+[vars]
+FIREBASE_KEY = "AIzaSyBtINAZeMK_-9Di840xg46kTI1IjFdPFdw"
+FIREBASE_DB = "https://megan-corp-default-rtdb.firebaseio.com"
+
+

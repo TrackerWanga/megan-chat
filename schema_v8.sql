@@ -1,0 +1,10 @@
+CREATE TABLE IF NOT EXISTS muted_rooms (room_id TEXT, user_id TEXT, muted_until INTEGER, PRIMARY KEY (room_id, user_id));
+CREATE TABLE IF NOT EXISTS starred_messages (message_id TEXT, user_id TEXT, PRIMARY KEY (message_id, user_id));
+CREATE TABLE IF NOT EXISTS unread_markers (room_id TEXT, user_id TEXT, marked_unread INTEGER DEFAULT 0, PRIMARY KEY (room_id, user_id));
+CREATE TABLE IF NOT EXISTS privacy_settings (user_id TEXT PRIMARY KEY, settings TEXT);
+CREATE TABLE IF NOT EXISTS user_sessions (id TEXT PRIMARY KEY, user_id TEXT, device TEXT, ip TEXT, created_at INTEGER, expires_at INTEGER);
+CREATE TABLE IF NOT EXISTS reported_messages (message_id TEXT, reported_by TEXT, reason TEXT, created_at INTEGER DEFAULT (unixepoch()));
+CREATE TABLE IF NOT EXISTS two_factor (user_id TEXT PRIMARY KEY, secret TEXT, enabled INTEGER DEFAULT 0);
+ALTER TABLE users ADD COLUMN bio TEXT;
+CREATE TABLE IF NOT EXISTS drafts (room_id TEXT, user_id TEXT, text TEXT, updated_at INTEGER DEFAULT (unixepoch()), PRIMARY KEY (room_id, user_id));
+ALTER TABLE messages ADD COLUMN forwarded_from TEXT;
