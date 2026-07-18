@@ -1,22 +1,21 @@
 name = "megan-chat"
 main = "src/index.ts"
 compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
 
-[[durable_objects.bindings]]
-name = "CHAT_ROOM"
-class_name = "ChatRoom"
+[[d1_databases]]
+binding = "DB"
+database_name = "megan-auth-db"
+database_id = "46eed660-594a-4992-b7bf-8d12125987e6"
+
+[durable_objects]
+bindings = [{ name = "CHAT_ROOM", class_name = "ChatRoom" }]
 
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["ChatRoom"]
 
-[[d1_databases]]
-binding = "DB"
-database_name = "megan-chat-db"
-database_id = "2a65b5c4-0439-4ffe-9d52-4b986a0afb03"
-
 [vars]
-FIREBASE_KEY = "AIzaSyBtINAZeMK_-9Di840xg46kTI1IjFdPFdw"
-FIREBASE_DB = "https://megan-corp-default-rtdb.firebaseio.com"
-
-
+AUTH_URL = "https://auth.megan.qzz.io"
+INTERNAL_SECRET = "meganadmin2026"
+ENVIRONMENT = "production"

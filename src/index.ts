@@ -1,1493 +1,255 @@
-// ══════════════════════════════════════════════════════════
-// Megan Chat API v2.0 — Complete Chat Platform
-// Messages | Reactions | Threads | Polls | Read Receipts
-// Stickers | Search | Blocking | Admin | Scheduled
-// ══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+// Megan Chat v3.0 — Real-Time Relay Service
+// ═══════════════════════════════════════════════════════════
 
-interface Env {
-  CHAT_ROOM: DurableObjectNamespace;
-  DB: D1Database;
-  FIREBASE_KEY: string;
-  FIREBASE_DB: string;
-}
+import { Env, ok, err, corsHeaders } from "./types";
+import { authenticateDev, getTierFeatures, canAccessFeature } from "./utils/auth";
+import { getTemplates, getTemplate, generateSQL, generateFirebase, generateMongoDB, generateFromWords } from "./schemas/builder";
 
-const cors = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, x-api-key",
-};
-
-const FB_KEY = "AIzaSyBtINAZeMK_-9Di840xg46kTI1IjFdPFdw";
-const FB_DB = "https://megan-corp-default-rtdb.firebaseio.com";
-
-async function broadcastToRoom(env: Env, roomId: string, message: any) {
-  try {
-    const doId = env.CHAT_ROOM.idFromName(roomId);
-    const room = env.CHAT_ROOM.get(doId);
-    await room.fetch(new Request("https://internal/broadcast", { method: "POST", body: JSON.stringify(message) }));
-  } catch {}
-}
+export { ChatRoom } from "./relay/chat-room";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
+
     const url = new URL(request.url);
-    const p = url.pathname;
-    const m = request.method;
-    if (m === "OPTIONS") return new Response(null, { headers: cors });
+    const path = url.pathname;
+    const method = request.method;
 
     try {
+      // ═══ PUBLIC ═══
+      if (path === "/" || path === "/health") {
+        return ok({
+          status: "ok", name: "Megan Chat v3.0", version: "3.0.0",
+          description: "Real-time relay service. Developers bring their own storage.",
+          endpoints: {
+            relay: ["/api/relay/message", "/api/relay/typing", "/api/relay/recording", "/api/relay/read", "/api/relay/presence"],
+            signaling: ["/api/calls/offer", "/api/calls/answer", "/api/calls/ice"],
+            schemas: ["/api/schemas/templates", "/api/schemas/generate"],
+            dev: ["/api/dev/me", "/api/dev/webhook"],
+            shop: ["/api/shop/stickers", "/api/shop/emojis", "/api/shop/buy"],
+            websocket: "/ws",
+          },
+        });
+      }
+
+      if (path === "/api/endpoints") {
+        return ok({
+          relay: {
+            message: "POST /api/relay/message",
+            typing: "POST /api/relay/typing",
+            recording: "POST /api/relay/recording",
+            read: "POST /api/relay/read",
+            presence: "POST /api/relay/presence",
+          },
+          signaling: {
+            offer: "POST /api/calls/offer",
+            answer: "POST /api/calls/answer",
+            ice: "POST /api/calls/ice",
+          },
+          schemas: {
+            templates: "GET /api/schemas/templates",
+            generate: "POST /api/schemas/generate",
+          },
+          shop: {
+            stickers: "GET /api/shop/stickers",
+            emojis: "GET /api/shop/emojis",
+            buy: "POST /api/shop/buy",
+          },
+          websocket: "GET /ws?user_id=xxx&username=xxx&room_id=xxx&api_key=xxx",
+        });
+      }
+
       // ═══ AUTH ═══
-      if (p === "/api/auth/register" && m === "POST") {
-        const { email, password, username, displayName } = await request.json() as any;
-        const ar = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${FB_KEY}`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({email,password,returnSecureToken:true}) });
-        const ad = await ar.json() as any;
-        if (ad.error) return Response.json({ error: ad.error.message }, { status: 400 });
-        await env.DB.prepare("INSERT OR IGNORE INTO users (uid, username, display_name) VALUES (?, ?, ?)").bind(ad.localId, username, displayName||username).run();
-        await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=${FB_KEY}`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({requestType:"VERIFY_EMAIL",idToken:ad.idToken}) });
-        return Response.json({ success:true, uid:ad.localId, token:ad.idToken, user:{uid:ad.localId,username,displayName:displayName||username} }, { headers: cors });
-      }
-      if (p === "/api/auth/login" && m === "POST") {
-        const { email, password } = await request.json() as any;
-        const ar = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FB_KEY}`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({email,password,returnSecureToken:true}) });
-        const ad = await ar.json() as any;
-        if (ad.error) return Response.json({ error: ad.error.message }, { status: 400 });
-        const user = await env.DB.prepare("SELECT * FROM users WHERE uid = ?").bind(ad.localId).first();
-        await env.DB.prepare("UPDATE users SET status='online', last_seen=? WHERE uid=?").bind(Date.now(), ad.localId).run();
-        return Response.json({ success:true, uid:ad.localId, token:ad.idToken, user }, { headers: cors });
+      const auth = await authenticateDev(request, env);
+      if (!auth.dev) return err(auth.error || "Unauthorized", auth.status || 401);
+      const dev = auth.dev;
+      const features = getTierFeatures(dev.tier);
+
+      // ═══ SCHEMA BUILDER ═══
+      if (path === "/api/schemas/templates" && method === "GET") {
+        return ok({ templates: getTemplates() });
       }
 
-      
-      // ═══ PHONE AUTH (OPTIONAL) ═══
-      
-      // Register with phone (optional — email still works)
-      if (p === "/api/auth/phone/register" && m === "POST") {
-        const { phone, username, displayName } = await request.json() as any;
-        if (!phone || !username) return Response.json({ error:"phone and username required" }, { status:400, headers:cors });
-        
-        // Generate custom Megan Chat ID (e.g., MG-254-7XXXX)
-        const countryCode = phone.replace(/[^0-9]/g,'').substring(0,3) || "000";
-        const shortPhone = phone.replace(/[^0-9]/g,'').slice(-6);
-        const meganId = `MG-${countryCode}-${shortPhone}-${crypto.randomUUID().substring(0,4)}`;
-        
-        // Create user with phone
-        const uid = crypto.randomUUID();
-        await env.DB.prepare("INSERT OR IGNORE INTO users (uid, username, display_name, phone, megan_id, phone_verified) VALUES (?,?,?,?,?,0)")
-          .bind(uid, username, displayName||username, phone, meganId).run();
-        
-        // Send SMS verification
-        const code = String(Math.floor(100000 + Math.random() * 900000));
-        await env.DB.prepare("INSERT OR REPLACE INTO verification_codes (phone, code, expires_at, method) VALUES (?,?,?,?)")
-          .bind(phone, code, Date.now()+600000, "firebase").run();
-        
-        // Try Firebase SMS
+      if (path.startsWith("/api/schemas/template/") && method === "GET") {
+        const id = path.split("/")[4];
+        const template = getTemplate(id);
+        if (!template) return err("Template not found", 404);
+        return ok({ template: { id, ...template } });
+      }
+
+      if (path === "/api/schemas/generate" && method === "POST") {
+        const { template, database, words } = await request.json() as any;
+        if (words) {
+          return ok({ schema: generateFromWords(words), format: "sql" });
+        }
+        if (!template) return err("template or words required");
+        const format = database || "sqlite";
+        if (format === "firebase") return ok(generateFirebase(template));
+        if (format === "mongodb") return ok(generateMongoDB(template));
+        return ok({ schema: generateSQL(template, format), format });
+      }
+
+      // ═══ RELAY — Message ═══
+      if (path === "/api/relay/message" && method === "POST") {
+        const { room_id, message_id, text, type, reply_to } = await request.json() as any;
+        if (!room_id || !text) return err("room_id and text required");
         try {
-          await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:sendVerificationCode?key=${FB_KEY}`, {
-            method:"POST", headers:{"Content-Type":"application/json"},
-            body:JSON.stringify({ phoneNumber:phone })
-          });
-        } catch (e) {}
-        
-        return Response.json({
-          success:true, uid, meganId,
-          message:`SMS sent to ${phone}. Verify to complete registration.`,
-          user: { uid, username, displayName:displayName||username, phone, meganId, verified:false }
-        }, { headers:cors });
-      }
-
-      // Verify phone code
-      if (p === "/api/auth/phone/verify" && m === "POST") {
-        const { phone, code } = await request.json() as any;
-        const record = await env.DB.prepare("SELECT * FROM verification_codes WHERE phone=? AND code=? AND expires_at > ?")
-          .bind(phone, code, Date.now()).first();
-        if (!record) return Response.json({ error:"Invalid or expired code" }, { status:400, headers:cors });
-        
-        await env.DB.prepare("DELETE FROM verification_codes WHERE phone=?").bind(phone).run();
-        await env.DB.prepare("UPDATE users SET phone_verified=1 WHERE phone=?").bind(phone).run();
-        
-        return Response.json({ success:true, message:"Phone verified! You can now login with this phone number." }, { headers:cors });
-      }
-
-      // Login with phone
-      if (p === "/api/auth/phone/login" && m === "POST") {
-        const { phone } = await request.json() as any;
-        if (!phone) return Response.json({ error:"phone required" }, { status:400, headers:cors });
-        
-        // Send verification code
-        const code = String(Math.floor(100000 + Math.random() * 900000));
-        await env.DB.prepare("INSERT OR REPLACE INTO verification_codes (phone, code, expires_at, method) VALUES (?,?,?,?)")
-          .bind(phone, code, Date.now()+600000, "firebase").run();
-        
-        try {
-          await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:sendVerificationCode?key=${FB_KEY}`, {
-            method:"POST", headers:{"Content-Type":"application/json"},
-            body:JSON.stringify({ phoneNumber:phone })
-          });
-        } catch (e) {}
-        
-        return Response.json({ success:true, message:`Code sent to ${phone}` }, { headers:cors });
-      }
-
-      // Verify phone login
-      if (p === "/api/auth/phone/login/verify" && m === "POST") {
-        const { phone, code } = await request.json() as any;
-        const record = await env.DB.prepare("SELECT * FROM verification_codes WHERE phone=? AND code=? AND expires_at > ?")
-          .bind(phone, code, Date.now()).first();
-        if (!record) return Response.json({ error:"Invalid or expired code" }, { status:400, headers:cors });
-        
-        await env.DB.prepare("DELETE FROM verification_codes WHERE phone=?").bind(phone).run();
-        
-        const user = await env.DB.prepare("SELECT * FROM users WHERE phone=? AND phone_verified=1").bind(phone).first();
-        if (!user) return Response.json({ error:"Phone not registered or not verified" }, { status:404, headers:cors });
-        
-        await env.DB.prepare("UPDATE users SET status='online', last_seen=? WHERE phone=?").bind(Date.now(), phone).run();
-        
-        // Generate JWT-like token
-        const token = btoa(JSON.stringify({ uid:user.uid, phone:user.phone, meganId:user.megan_id, exp:Date.now()+86400000 }));
-        
-        return Response.json({ success:true, uid:user.uid, token, user }, { headers:cors });
-      }
-
-      // Search by Megan ID
-      if (p === "/api/users/meganid" && m === "GET") {
-        const mid = url.searchParams.get("mid")||"";
-        const user = await env.DB.prepare("SELECT uid, username, display_name, megan_id, phone_verified FROM users WHERE megan_id=?").bind(mid).first();
-        if (!user) return Response.json({ error:"User not found" }, { status:404, headers:cors });
-        return Response.json({ user }, { headers:cors });
-      }
-
-      // ═══ API KEYS ═══
-      if (p === "/api/keys/generate" && m === "POST") {
-        const { uid, name } = await request.json() as any;
-        const key = "megan_chat_"+crypto.randomUUID().replace(/-/g,"").substring(0,16);
-        await env.DB.prepare("INSERT INTO api_keys (key, user_id, name) VALUES (?, ?, ?)").bind(key, uid, name||"Default").run();
-        return Response.json({ success:true, key }, { headers: cors });
-      }
-
-      // ═══ ROOMS ═══
-      if (p === "/api/rooms" && m === "POST") {
-        const { name, type, createdBy, members } = await request.json() as any;
-        const id = crypto.randomUUID();
-        await env.DB.prepare("INSERT INTO chat_rooms (id, name, type, created_by) VALUES (?,?,?,?)").bind(id,name,type||"group",createdBy).run();
-        await env.DB.prepare("INSERT INTO room_members (room_id,user_id,role) VALUES (?,?,'admin')").bind(id,createdBy).run();
-        if (members) for (const mu of members) await env.DB.prepare("INSERT OR IGNORE INTO room_members (room_id,user_id) VALUES (?,?)").bind(id,mu).run();
-        return Response.json({ success:true, room:{id,name,type} }, { headers: cors });
-      }
-      if (p === "/api/rooms" && m === "GET") {
-        const uid = url.searchParams.get("uid")||"";
-        const { results } = await env.DB.prepare("SELECT r.* FROM chat_rooms r JOIN room_members m ON r.id=m.room_id WHERE m.user_id=?").bind(uid).all();
-        return Response.json({ rooms:results }, { headers: cors });
-      }
-
-      // ═══ MESSAGES ═══
-      if (p.startsWith("/api/rooms/") && p.endsWith("/messages") && m === "GET") {
-        const roomId = p.split("/")[3];
-        const { results } = await env.DB.prepare("SELECT m.*, u.username, u.display_name FROM messages m JOIN users u ON m.user_id=u.uid WHERE m.room_id=? AND m.deleted=0 ORDER BY m.created_at DESC LIMIT 100").bind(roomId).all();
-        return Response.json({ messages:results.reverse() }, { headers: cors });
-      }
-      if (p.startsWith("/api/messages/") && p.endsWith("/edit") && m === "PUT") {
-        const msgId = p.split("/")[3];
-        const { text, userId } = await request.json() as any;
-        const msg = await env.DB.prepare("SELECT * FROM messages WHERE id=? AND user_id=?").bind(msgId,userId).first();
-        if (!msg) return Response.json({ error:"Not found or not yours" }, { status:404 });
-        await env.DB.prepare("UPDATE messages SET text=?, edited=1, edited_at=? WHERE id=?").bind(text,Date.now(),msgId).run();
-        await broadcastToRoom(env, msg.room_id, { type:"message_edited", messageId:msgId, text, userId });
-        return Response.json({ success:true }, { headers: cors });
-      }
-      if (p.startsWith("/api/messages/") && p.endsWith("/delete") && m === "DELETE") {
-        const msgId = p.split("/")[3];
-        const { userId } = await request.json() as any;
-        const msg = await env.DB.prepare("SELECT * FROM messages WHERE id=? AND user_id=?").bind(msgId,userId).first();
-        if (!msg) return Response.json({ error:"Not found or not yours" }, { status:404 });
-        await env.DB.prepare("UPDATE messages SET deleted=1, deleted_at=? WHERE id=?").bind(Date.now(),msgId).run();
-        await broadcastToRoom(env, msg.room_id, { type:"message_deleted", messageId:msgId, userId });
-        return Response.json({ success:true }, { headers: cors });
-      }
-
-      // ═══ REACTIONS ═══
-      if (p.startsWith("/api/messages/") && p.endsWith("/react") && m === "POST") {
-        const msgId = p.split("/")[3];
-        const { userId, reaction } = await request.json() as any;
-        await env.DB.prepare("INSERT OR REPLACE INTO reactions (message_id,user_id,reaction) VALUES (?,?,?)").bind(msgId,userId,reaction).run();
-        const msg = await env.DB.prepare("SELECT room_id FROM messages WHERE id=?").bind(msgId).first();
-        await broadcastToRoom(env, msg.room_id, { type:"reaction_added", messageId:msgId, userId, reaction });
-        return Response.json({ success:true }, { headers: cors });
-      }
-
-      // ═══ READ RECEIPTS ═══
-      if (p === "/api/read-receipts" && m === "POST") {
-        const { roomId, userId } = await request.json() as any;
-        await env.DB.prepare("INSERT OR REPLACE INTO read_receipts (room_id,user_id,last_read_at) VALUES (?,?,?)").bind(roomId,userId,Date.now()).run();
-        await broadcastToRoom(env, roomId, { type:"read_receipt", roomId, userId, timestamp:Date.now() });
-        return Response.json({ success:true }, { headers: cors });
-      }
-
-      // ═══ FRIENDS ═══
-      if (p === "/api/friends" && m === "GET") {
-        const uid = url.searchParams.get("uid")||"";
-        const { results } = await env.DB.prepare("SELECT u.* FROM friends f JOIN users u ON f.friend_uid=u.uid WHERE f.user_uid=?").bind(uid).all();
-        return Response.json({ friends:results }, { headers: cors });
-      }
-      if (p === "/api/friends/request" && m === "POST") {
-        const { fromUid, toUsername } = await request.json() as any;
-        const tu = await env.DB.prepare("SELECT uid FROM users WHERE username=?").bind(toUsername).first();
-        if (!tu) return Response.json({ error:"User not found" }, { status:404 });
-        const id = crypto.randomUUID();
-        await env.DB.prepare("INSERT INTO friend_requests (id,from_uid,to_uid) VALUES (?,?,?)").bind(id,fromUid,tu.uid).run();
-        return Response.json({ success:true }, { headers: cors });
-      }
-      if (p === "/api/friends/accept" && m === "POST") {
-        const { requestId, uid } = await request.json() as any;
-        const fr = await env.DB.prepare("SELECT * FROM friend_requests WHERE id=? AND to_uid=?").bind(requestId,uid).first();
-        if (!fr) return Response.json({ error:"Not found" }, { status:404 });
-        await env.DB.prepare("UPDATE friend_requests SET status='accepted' WHERE id=?").bind(requestId).run();
-        await env.DB.prepare("INSERT OR IGNORE INTO friends (user_uid,friend_uid) VALUES (?,?)").bind(uid,fr.from_uid).run();
-        await env.DB.prepare("INSERT OR IGNORE INTO friends (user_uid,friend_uid) VALUES (?,?)").bind(fr.from_uid,uid).run();
-        const roomId = crypto.randomUUID();
-        await env.DB.prepare("INSERT INTO chat_rooms (id,name,type) VALUES (?,'dm:'||?||':'||?,'direct')").bind(roomId,uid,fr.from_uid).run();
-        await env.DB.prepare("INSERT INTO room_members (room_id,user_id) VALUES (?,?)").bind(roomId,uid).run();
-        await env.DB.prepare("INSERT INTO room_members (room_id,user_id) VALUES (?,?)").bind(roomId,fr.from_uid).run();
-        return Response.json({ success:true, roomId }, { headers: cors });
-      }
-
-      // ═══ UNIFIED SEARCH ═══
-      // Search by ANY identifier: username, phone, Megan ID, display name
-      if (p === "/api/search/users" && m === "GET") {
-        const q = url.searchParams.get("q")||"";
-        const { results } = await env.DB.prepare(
-          "SELECT uid, username, display_name, phone, megan_id, avatar_url, status FROM users WHERE username LIKE ? OR display_name LIKE ? OR phone LIKE ? OR megan_id LIKE ? LIMIT 20"
-        ).bind(`%${q}%`,`%${q}%`,`%${q}%`,`%${q}%`).all();
-        return Response.json({ users:results }, { headers: cors });
-      }
-
-      // Find user by exact phone
-      if (p === "/api/users/by-phone" && m === "GET") {
-        const phone = url.searchParams.get("phone")||"";
-        const user = await env.DB.prepare("SELECT uid, username, display_name, phone, megan_id, avatar_url, status FROM users WHERE phone=?").bind(phone).first();
-        if (!user) return Response.json({ error:"User not found" }, { status:404, headers:cors });
-        return Response.json({ user }, { headers: cors });
-      }
-
-      // Find user by Megan ID
-      if (p === "/api/users/by-id" && m === "GET") {
-        const mid = url.searchParams.get("mid")||"";
-        const user = await env.DB.prepare("SELECT uid, username, display_name, phone, megan_id, avatar_url, status FROM users WHERE megan_id=?").bind(mid).first();
-        if (!user) return Response.json({ error:"User not found" }, { status:404, headers:cors });
-        return Response.json({ user }, { headers: cors });
-      }
-
-      // Make call by ANY identifier (username, phone, Megan ID, or direct uid)
-      if (p === "/api/calls/call" && m === "POST") {
-        const { from, to, offer, callType } = await request.json() as any;
-        if (!from || !to || !offer) return Response.json({ error:"from, to, offer required" }, { status:400, headers:cors });
-        
-        // Find the target user by any identifier
-        const target = await env.DB.prepare(
-          "SELECT uid, username FROM users WHERE uid=? OR username=? OR phone=? OR megan_id=?"
-        ).bind(to, to, to, to).first();
-        
-        if (!target) return Response.json({ error:"User not found by that identifier" }, { status:404, headers:cors });
-        
-        const callId = crypto.randomUUID();
-        
-        // Forward offer to target
-        try {
-          const doId = env.CHAT_ROOM.idFromName(`user:${target.uid}`);
+          const doId = env.CHAT_ROOM.idFromName(room_id);
           const room = env.CHAT_ROOM.get(doId);
-          await room.fetch(new Request("https://internal/signal", {
+          await room.fetch(new Request("https://internal/broadcast", {
             method: "POST",
             body: JSON.stringify({
-              type: "incoming_call",
-              callId, from, offer,
-              callType: callType||"video",
-              timestamp: Date.now()
-            })
+              type: "message",
+              payload: { message_id: message_id || crypto.randomUUID(), room_id, sender_id: dev.uid, sender_username: dev.username, text, type: type || "text", reply_to: reply_to || null, timestamp: Date.now() },
+            }),
           }));
-        } catch (e) {}
-        
-        await env.DB.prepare("INSERT INTO calls (id, caller_uid, callee_uid, status, call_type, started_at) VALUES (?,?,?,'ringing',?,?)")
-          .bind(callId, from, target.uid, callType||"video", Date.now()).run();
-        
-        return Response.json({ success:true, callId, target:target.username, status:"ringing" }, { headers: cors });
-      }
-      if (p === "/api/search/messages" && m === "GET") {
-        const q = url.searchParams.get("q")||"";
-        const rid = url.searchParams.get("roomId");
-        const { results } = await env.DB.prepare("SELECT m.*, u.username FROM messages m JOIN users u ON m.user_id=u.uid WHERE m.text LIKE ?"+(rid?" AND m.room_id=?":"")+" AND m.deleted=0 ORDER BY m.created_at DESC LIMIT 50").bind(`%${q}%`,...(rid?[rid]:[])).all();
-        return Response.json({ messages:results }, { headers: cors });
+        } catch {}
+        return ok({ success: true, relayed: true, message: "Message relayed to room members" });
       }
 
-      // ═══ BLOCKING ═══
-      if (p === "/api/blocks" && m === "POST") {
-        const { blockerUid, blockedUid } = await request.json() as any;
-        await env.DB.prepare("INSERT OR IGNORE INTO user_blocks (blocker_uid,blocked_uid) VALUES (?,?)").bind(blockerUid,blockedUid).run();
-        return Response.json({ success:true }, { headers: cors });
+      // ═══ RELAY — Typing ═══
+      if (path === "/api/relay/typing" && method === "POST") {
+        const { room_id, is_typing } = await request.json() as any;
+        if (!room_id) return err("room_id required");
+        try {
+          const doId = env.CHAT_ROOM.idFromName(room_id);
+          const room = env.CHAT_ROOM.get(doId);
+          await room.fetch(new Request("https://internal/broadcast", {
+            method: "POST",
+            body: JSON.stringify({ type: "typing", payload: { room_id, user_id: dev.uid, username: dev.username, is_typing: !!is_typing }, exclude: dev.uid }),
+          }));
+        } catch {}
+        return ok({ success: true });
       }
 
-      // ═══ POLLS ═══
-      if (p === "/api/polls" && m === "POST") {
-        const { roomId, creatorUid, question, options } = await request.json() as any;
-        const id = crypto.randomUUID();
-        await env.DB.prepare("INSERT INTO polls (id,room_id,creator_uid,question,options) VALUES (?,?,?,?,?)").bind(id,roomId,creatorUid,question,JSON.stringify(options)).run();
-        await broadcastToRoom(env, roomId, { type:"poll_created", pollId:id, question, options, creatorUid });
-        return Response.json({ success:true, pollId:id }, { headers: cors });
-      }
-      if (p.startsWith("/api/polls/") && p.endsWith("/vote") && m === "POST") {
-        const pollId = p.split("/")[3];
-        const { userId, optionIndex } = await request.json() as any;
-        await env.DB.prepare("INSERT OR REPLACE INTO poll_votes (poll_id,user_id,option_index) VALUES (?,?,?)").bind(pollId,userId,optionIndex).run();
-        const { results } = await env.DB.prepare("SELECT option_index, COUNT(*) as count FROM poll_votes WHERE poll_id=? GROUP BY option_index").bind(pollId).all();
-        return Response.json({ success:true, results }, { headers: cors });
-      }
-
-      // ═══ SCHEDULED ═══
-      if (p === "/api/scheduled" && m === "POST") {
-        const { roomId, userId, text, sendAt } = await request.json() as any;
-        const id = crypto.randomUUID();
-        await env.DB.prepare("INSERT INTO scheduled_messages (id,room_id,user_id,text,send_at) VALUES (?,?,?,?,?)").bind(id,roomId,userId,text,sendAt).run();
-        return Response.json({ success:true, id, sendAt }, { headers: cors });
+      // ═══ RELAY — Recording ═══
+      if (path === "/api/relay/recording" && method === "POST") {
+        const { room_id, is_recording, duration } = await request.json() as any;
+        if (!room_id) return err("room_id required");
+        try {
+          const doId = env.CHAT_ROOM.idFromName(room_id);
+          const room = env.CHAT_ROOM.get(doId);
+          await room.fetch(new Request("https://internal/broadcast", {
+            method: "POST",
+            body: JSON.stringify({ type: "recording", payload: { room_id, user_id: dev.uid, username: dev.username, is_recording: !!is_recording, duration: duration || 0 }, exclude: dev.uid }),
+          }));
+        } catch {}
+        return ok({ success: true });
       }
 
-      // ═══ STICKERS ═══
-      if (p === "/api/stickers" && m === "GET") {
-        // Return available sticker packs
-        const stickers = [
-          { id:"wave", url:"👋", pack:"greetings" },
-          { id:"thumbsup", url:"👍", pack:"reactions" },
-          { id:"heart", url:"❤️", pack:"reactions" },
-          { id:"laugh", url:"😂", pack:"reactions" },
-          { id:"fire", url:"🔥", pack:"reactions" },
-          { id:"party", url:"🎉", pack:"celebrations" },
-          { id:"cool", url:"😎", pack:"reactions" },
-          { id:"cry", url:"😢", pack:"reactions" },
-        ];
-        return Response.json({ stickers }, { headers: cors });
+      // ═══ RELAY — Read Receipt ═══
+      if (path === "/api/relay/read" && method === "POST") {
+        const { room_id, message_id } = await request.json() as any;
+        if (!room_id || !message_id) return err("room_id and message_id required");
+        try {
+          const doId = env.CHAT_ROOM.idFromName(room_id);
+          const room = env.CHAT_ROOM.get(doId);
+          await room.fetch(new Request("https://internal/broadcast", {
+            method: "POST",
+            body: JSON.stringify({ type: "read_receipt", payload: { room_id, message_id, user_id: dev.uid, status: "read", timestamp: Date.now() } }),
+          }));
+        } catch {}
+        return ok({ success: true, status: "read", message_id });
       }
 
-      
+      // ═══ RELAY — Presence ═══
+      if (path === "/api/relay/presence" && method === "POST") {
+        const { status } = await request.json() as any;
+        return ok({ success: true, user_id: dev.uid, status: status || "online" });
+      }
+
       // ═══ WEBRTC SIGNALING ═══
-      
-      // User A initiates a call
-      if (p === "/api/calls/offer" && m === "POST") {
-        const { from, to, offer, callType } = await request.json() as any;
-        if (!from || !to || !offer) return Response.json({ error:"from, to, offer required" }, { status:400, headers:cors });
-        
+      if (path === "/api/calls/offer" && method === "POST") {
+        if (!canAccessFeature(dev, "webrtc_audio")) return err("WebRTC calls require Gold tier or higher", 403);
+        const { to, offer, call_type } = await request.json() as any;
+        if (!to || !offer) return err("to and offer required");
         const callId = crypto.randomUUID();
-        
-        // Forward offer to User B via their WebSocket
         try {
           const doId = env.CHAT_ROOM.idFromName(`user:${to}`);
           const room = env.CHAT_ROOM.get(doId);
-          await room.fetch(new Request("https://internal/signal", {
+          await room.fetch(new Request("https://internal/broadcast", {
             method: "POST",
-            body: JSON.stringify({
-              type: "incoming_call",
-              callId,
-              from,
-              offer,
-              callType: callType || "video", // "audio" | "video"
-              timestamp: Date.now()
-            })
+            body: JSON.stringify({ type: "incoming_call", payload: { call_id: callId, from: dev.uid, from_username: dev.username, offer, call_type: call_type || "audio", timestamp: Date.now() } }),
           }));
-        } catch (e) {}
-        
-        // Store active call in D1
-        await env.DB.prepare("INSERT INTO calls (id, caller_uid, callee_uid, status, call_type, started_at) VALUES (?,?,?,'ringing',?,?)")
-          .bind(callId, from, to, callType||"video", Date.now()).run();
-        
-        return Response.json({ success:true, callId, status:"ringing" }, { headers:cors });
+        } catch {}
+        return ok({ success: true, call_id: callId, status: "ringing" });
       }
 
-      // User B accepts the call
-      if (p === "/api/calls/answer" && m === "POST") {
-        const { callId, userId, answer } = await request.json() as any;
-        if (!callId || !userId || !answer) return Response.json({ error:"callId, userId, answer required" }, { status:400, headers:cors });
-        
-        const call = await env.DB.prepare("SELECT * FROM calls WHERE id=?").bind(callId).first();
-        if (!call) return Response.json({ error:"Call not found" }, { status:404, headers:cors });
-        
-        // Update call status
-        await env.DB.prepare("UPDATE calls SET status='active', answered_at=? WHERE id=?").bind(Date.now(), callId).run();
-        
-        // Forward answer to caller
+      if (path === "/api/calls/answer" && method === "POST") {
+        const { call_id, answer } = await request.json() as any;
+        if (!call_id || !answer) return err("call_id and answer required");
         try {
-          const doId = env.CHAT_ROOM.idFromName(`user:${call.caller_uid}`);
+          const doId = env.CHAT_ROOM.idFromName(`call:${call_id}`);
           const room = env.CHAT_ROOM.get(doId);
-          await room.fetch(new Request("https://internal/signal", {
+          await room.fetch(new Request("https://internal/broadcast", {
             method: "POST",
-            body: JSON.stringify({
-              type: "call_accepted",
-              callId,
-              answer,
-              userId,
-              timestamp: Date.now()
-            })
+            body: JSON.stringify({ type: "call_accepted", payload: { call_id, answer, user_id: dev.uid, timestamp: Date.now() } }),
           }));
-        } catch (e) {}
-        
-        return Response.json({ success:true, callId, status:"active" }, { headers:cors });
+        } catch {}
+        return ok({ success: true, call_id, status: "active" });
       }
 
-      // Reject / End call
-      if (p === "/api/calls/reject" && m === "POST") {
-        const { callId, userId, reason } = await request.json() as any;
-        
-        const call = await env.DB.prepare("SELECT * FROM calls WHERE id=?").bind(callId).first();
-        if (!call) return Response.json({ error:"Call not found" }, { status:404, headers:cors });
-        
-        await env.DB.prepare("UPDATE calls SET status=?, ended_at=? WHERE id=?")
-          .bind(reason||"rejected", Date.now(), callId).run();
-        
-        // Notify the other user
-        const otherUser = call.caller_uid === userId ? call.callee_uid : call.caller_uid;
+      if (path === "/api/calls/ice" && method === "POST") {
+        const { call_id, candidate } = await request.json() as any;
+        if (!call_id || !candidate) return err("call_id and candidate required");
         try {
-          const doId = env.CHAT_ROOM.idFromName(`user:${otherUser}`);
+          const doId = env.CHAT_ROOM.idFromName(`call:${call_id}`);
           const room = env.CHAT_ROOM.get(doId);
-          await room.fetch(new Request("https://internal/signal", {
+          await room.fetch(new Request("https://internal/broadcast", {
             method: "POST",
-            body: JSON.stringify({
-              type: "call_ended",
-              callId,
-              reason: reason||"rejected",
-              userId,
-              timestamp: Date.now()
-            })
+            body: JSON.stringify({ type: "ice_candidate", payload: { call_id, candidate, user_id: dev.uid } }),
           }));
-        } catch (e) {}
-        
-        return Response.json({ success:true, callId, status:reason||"rejected" }, { headers:cors });
+        } catch {}
+        return ok({ success: true });
       }
 
-      // Exchange ICE candidates (network path discovery)
-      if (p === "/api/calls/ice" && m === "POST") {
-        const { callId, userId, candidate } = await request.json() as any;
-        if (!callId || !userId || !candidate) return Response.json({ error:"callId, userId, candidate required" }, { status:400, headers:cors });
-        
-        const call = await env.DB.prepare("SELECT * FROM calls WHERE id=?").bind(callId).first();
-        if (!call) return Response.json({ error:"Call not found" }, { status:404, headers:cors });
-        
-        // Forward ICE to the other user
-        const otherUser = call.caller_uid === userId ? call.callee_uid : call.caller_uid;
-        try {
-          const doId = env.CHAT_ROOM.idFromName(`user:${otherUser}`);
-          const room = env.CHAT_ROOM.get(doId);
-          await room.fetch(new Request("https://internal/signal", {
-            method: "POST",
-            body: JSON.stringify({
-              type: "ice_candidate",
-              callId,
-              candidate,
-              userId,
-              timestamp: Date.now()
-            })
-          }));
-        } catch (e) {}
-        
-        return Response.json({ success:true }, { headers:cors });
+      // ═══ DEV MANAGEMENT ═══
+      if (path === "/api/dev/me" && method === "GET") {
+        return ok({ developer: { uid: dev.uid, username: dev.username, tier: dev.tier, features } });
       }
 
-      // Get active calls for a user
-      if (p === "/api/calls/active" && m === "GET") {
-        const uid = url.searchParams.get("uid")||"";
-        const { results } = await env.DB.prepare(
-          "SELECT * FROM calls WHERE (caller_uid=? OR callee_uid=?) AND status IN ('ringing','active') ORDER BY started_at DESC"
-        ).bind(uid,uid).all();
-        return Response.json({ calls:results }, { headers:cors });
+      if (path === "/api/dev/webhook" && method === "POST") {
+        const { webhook_url } = await request.json() as any;
+        return ok({ success: true, webhook_url });
       }
 
-      // Call history
-      if (p === "/api/calls/history" && m === "GET") {
-        const uid = url.searchParams.get("uid")||"";
-        const { results } = await env.DB.prepare(
-          "SELECT * FROM calls WHERE (caller_uid=? OR callee_uid=?) ORDER BY started_at DESC LIMIT 50"
-        ).bind(uid,uid).all();
-        return Response.json({ calls:results }, { headers:cors });
+      // ═══ SHOP ═══
+      if (path === "/api/shop/stickers" && method === "GET") {
+        return ok({
+          stickers: [
+            { id: "megan-greetings", name: "Megan Greetings", icon: "👋", count: 12, price_mgc: 10 },
+            { id: "megan-reactions", name: "Mega Reactions", icon: "🔥", count: 20, price_mgc: 15 },
+            { id: "megan-kenya", name: "Kenyan Expressions", icon: "🇰🇪", count: 15, price_mgc: 20 },
+            { id: "megan-crypto", name: "Crypto Moods", icon: "📈", count: 18, price_mgc: 25 },
+          ],
+        });
       }
 
-      // Mute/Unmute (track control)
-      if (p === "/api/calls/mute" && m === "POST") {
-        const { callId, userId, mute } = await request.json() as any;
-        // Notify other user about mute state
-        const call = await env.DB.prepare("SELECT * FROM calls WHERE id=?").bind(callId).first();
-        if (!call) return Response.json({ error:"Call not found" }, { status:404, headers:cors });
-        
-        const otherUser = call.caller_uid === userId ? call.callee_uid : call.caller_uid;
-        try {
-          const doId = env.CHAT_ROOM.idFromName(`user:${otherUser}`);
-          const room = env.CHAT_ROOM.get(doId);
-          await room.fetch(new Request("https://internal/signal", {
-            method: "POST",
-            body: JSON.stringify({
-              type: mute ? "user_muted" : "user_unmuted",
-              callId, userId
-            })
-          }));
-        } catch (e) {}
-        
-        return Response.json({ success:true }, { headers:cors });
+      if (path === "/api/shop/emojis" && method === "GET") {
+        const { getAllEmojis, getEmojiCount, searchEmojis } = await import("./shop/emojis");
+        const q = url.searchParams.get("q") || "";
+        if (q) return ok({ query: q, results: searchEmojis(q) });
+        const all = getAllEmojis();
+        return ok({ total_emojis: getEmojiCount(), categories: all.map(c => ({ name: c.category, count: c.count, preview: c.emojis.slice(0, 5).join(" ") })), emojis: all });
       }
 
       // ═══ WEBSOCKET ═══
-      if (p === "/ws") {
-        const apiKey = url.searchParams.get("apikey")||request.headers.get("x-api-key")||"";
-        if (!apiKey) return Response.json({ error:"API key required" }, { status:401, headers:cors });
-        const id = env.CHAT_ROOM.idFromName(url.searchParams.get("room")||"global");
-        return env.CHAT_ROOM.get(id).fetch(request);
-      }
-
-      
-      // ═══ MEDIA MESSAGES (via base64, max 5MB) ═══
-      if (p === "/api/messages/media" && m === "POST") {
-        const { roomId, userId, type, file, fileName } = await request.json() as any;
-        if (!roomId || !userId || !type || !file) return Response.json({ error:"roomId, userId, type, file required" }, { status:400, headers:cors });
-        
-        // Store media in D1 as base64 (max 5MB)
-        if (file.length > 5000000) return Response.json({ error:"Media too large. Max 5MB." }, { status:400, headers:cors });
-        
-        const msgId = crypto.randomUUID();
-        const mediaTypes: Record<string,string> = { image:"🖼️ Image", video:"🎬 Video", audio:"🎵 Audio", document:"📄 Document", voice:"🎤 Voice Note", video_message:"📹 Video Message" };
-        
-        await env.DB.prepare("INSERT INTO messages (id, room_id, user_id, text, type, created_at) VALUES (?,?,?,?,?,?)")
-          .bind(msgId, roomId, userId, file, type, Date.now()).run();
-        
-        broadcastToRoom(env, roomId, {
-          type: "media_message",
-          messageId: msgId, userId, mediaType: type,
-          preview: file.substring(0, 100), // First 100 chars as preview
-          fileName: fileName || "file",
-          label: mediaTypes[type] || "📎 Media",
-          timestamp: Date.now()
-        });
-        
-        return Response.json({ success:true, messageId:msgId, type, label:mediaTypes[type]||"Media" }, { headers: cors });
-      }
-
-      // Serve media
-      if (p.startsWith("/api/media/") && m === "GET") {
-        const msgId = p.split("/")[3];
-        const msg = await env.DB.prepare("SELECT * FROM messages WHERE id=? AND type IN ('image','video','audio','document','voice','video_message')").bind(msgId).first();
-        if (!msg) return Response.json({ error:"Media not found" }, { status:404, headers:cors });
-        
-        const [meta, data] = (msg.text as string).split(",");
-        const mime = meta?.match(/data:(.*);base64/)?.[1] || "application/octet-stream";
-        const binary = atob(data || ""); const bytes = new Uint8Array(binary.length); for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-        
-        return new Response(bytes, { headers: {"Content-Type":mime, "Cache-Control":"public, max-age=31536000", ...cors} });
-      }
-
-      // ═══ GROUP CALLING ═══
-      if (p === "/api/calls/group/create" && m === "POST") {
-        const { creatorUid, participants, callType } = await request.json() as any;
-        if (!creatorUid || !participants || !participants.length) return Response.json({ error:"creatorUid and participants required" }, { status:400, headers:cors });
-        
-        const callId = crypto.randomUUID();
-        
-        // Notify all participants
-        for (const puid of participants) {
-          if (puid === creatorUid) continue;
-          try {
-            const doId = env.CHAT_ROOM.idFromName(`user:${puid}`);
-            const room = env.CHAT_ROOM.get(doId);
-            await room.fetch(new Request("https://internal/signal", {
-              method: "POST",
-              body: JSON.stringify({ type:"group_call_invite", callId, creator:creatorUid, participants, callType:callType||"video", timestamp:Date.now() })
-            }));
-          } catch (e) {}
-        }
-        
-        await env.DB.prepare("INSERT INTO group_calls (id, creator_uid, participants, call_type, status, started_at) VALUES (?,?,?,?,'ringing',?)")
-          .bind(callId, creatorUid, JSON.stringify(participants), callType||"video", Date.now()).run();
-        
-        return Response.json({ success:true, callId, participants, status:"ringing" }, { headers: cors });
-      }
-
-      if (p === "/api/calls/group/join" && m === "POST") {
-        const { callId, userId, offer } = await request.json() as any;
-        const call = await env.DB.prepare("SELECT * FROM group_calls WHERE id=?").bind(callId).first();
-        if (!call) return Response.json({ error:"Call not found" }, { status:404, headers:cors });
-        
-        // Notify creator that someone joined
-        try {
-          const doId = env.CHAT_ROOM.idFromName(`user:${call.creator_uid}`);
-          const room = env.CHAT_ROOM.get(doId);
-          await room.fetch(new Request("https://internal/signal", {
-            method: "POST",
-            body: JSON.stringify({ type:"group_call_joined", callId, userId, offer })
-          }));
-        } catch (e) {}
-        
-        return Response.json({ success:true, callId }, { headers: cors });
-      }
-
-      // ═══ STORIES / STATUS ═══
-      if (p === "/api/stories" && m === "POST") {
-        const { userId, type, content, caption, bgColor } = await request.json() as any;
-        const storyId = crypto.randomUUID();
-        const expiresAt = Date.now() + 86400000; // 24 hours
-        
-        await env.DB.prepare("INSERT INTO stories (id, user_id, type, content, caption, bg_color, expires_at, created_at) VALUES (?,?,?,?,?,?,?,?)")
-          .bind(storyId, userId, type||"text", content||"", caption||"", bgColor||"#6C63FF", expiresAt, Date.now()).run();
-        
-        return Response.json({ success:true, storyId, expiresAt }, { headers: cors });
-      }
-
-      if (p === "/api/stories" && m === "GET") {
-        const uid = url.searchParams.get("uid")||"";
-        // Get stories from user's friends that haven't expired
-        const { results } = await env.DB.prepare(
-          "SELECT s.*, u.username, u.display_name FROM stories s JOIN users u ON s.user_id=u.uid WHERE s.expires_at > ? AND (s.user_id IN (SELECT friend_uid FROM friends WHERE user_uid=?) OR s.user_id=?) ORDER BY s.created_at DESC LIMIT 50"
-        ).bind(Date.now(), uid, uid).all();
-        return Response.json({ stories:results }, { headers: cors });
-      }
-
-      if (p.startsWith("/api/stories/") && p.endsWith("/view") && m === "POST") {
-        const storyId = p.split("/")[2];
-        const { userId } = await request.json() as any;
-        await env.DB.prepare("INSERT OR IGNORE INTO story_views (story_id, viewer_uid) VALUES (?,?)").bind(storyId, userId).run();
-        return Response.json({ success:true }, { headers: cors });
-      }
-
-      // ═══ CHAT BACKUP / EXPORT ═══
-      if (p === "/api/backup" && m === "GET") {
-        const uid = url.searchParams.get("uid")||"";
-        const format = url.searchParams.get("format")||"json";
-        
-        const messages = await env.DB.prepare(
-          "SELECT m.*, r.name as room_name FROM messages m JOIN chat_rooms r ON m.room_id=r.id WHERE m.user_id=? ORDER BY m.created_at DESC LIMIT 1000"
-        ).bind(uid).all();
-        
-        const friends = await env.DB.prepare("SELECT u.username, u.display_name FROM friends f JOIN users u ON f.friend_uid=u.uid WHERE f.user_uid=?").bind(uid).all();
-        
-        const backup = {
-          exportedAt: new Date().toISOString(),
-          userId: uid,
-          messages: messages.results,
-          friends: friends.results,
-          totalMessages: messages.results?.length || 0
-        };
-        
-        if (format === "csv") {
-          const headers = "date,room,message,type";
-          const rows = (messages.results as any[]).map((m:any) => 
-            `${new Date(m.created_at).toISOString()},${m.room_name},${(m.text||'').replace(/,/g,' ')},${m.type||'text'}`
-          ).join("\n");
-          const csv = headers + "\n" + rows;
-          return new Response(csv, { headers: {"Content-Type":"text/csv", "Content-Disposition":"attachment; filename=chat-backup.csv", ...cors} });
-        }
-        
-        return Response.json({ backup }, { headers: cors });
-      }
-
-      // ═══ WEBHOOKS ═══
-      if (p === "/api/webhooks" && m === "POST") {
-        const { userId, url, events } = await request.json() as any;
-        const id = crypto.randomUUID();
-        await env.DB.prepare("INSERT OR REPLACE INTO webhooks (id, user_id, url, events) VALUES (?,?,?,?)")
-          .bind(id, userId, url, JSON.stringify(events||["message","call","user_joined"])).run();
-        return Response.json({ success:true, webhookId:id }, { headers: cors });
-      }
-
-      if (p === "/api/webhooks" && m === "GET") {
-        const uid = url.searchParams.get("uid")||"";
-        const { results } = await env.DB.prepare("SELECT * FROM webhooks WHERE user_id=?").bind(uid).all();
-        return Response.json({ webhooks:results }, { headers: cors });
-      }
-
-      // ═══ DISAPPEARING MESSAGES ═══
-      if (p === "/api/rooms/disappearing" && m === "POST") {
-        const { roomId, duration } = await request.json() as any;
-        // duration: 0=off, 86400=24h, 604800=7d, 2592000=30d
-        await env.DB.prepare("UPDATE chat_rooms SET disappearing_duration = ? WHERE id = ?").bind(duration||0, roomId).run();
-        return Response.json({ success:true, roomId, disappearingDuration:duration||0 }, { headers: cors });
-      }
-
-      // ═══ LOCATION SHARING ═══
-      if (p === "/api/messages/location" && m === "POST") {
-        const { roomId, userId, lat, lng, label } = await request.json() as any;
-        const msgId = crypto.randomUUID();
-        const locationData = JSON.stringify({ lat, lng, label:label||"📍 Location" });
-        
-        await env.DB.prepare("INSERT INTO messages (id, room_id, user_id, text, type, created_at) VALUES (?,?,?,?,?,?)")
-          .bind(msgId, roomId, userId, locationData, "location", Date.now()).run();
-        
-        broadcastToRoom(env, roomId, {
-          type:"location_shared", messageId:msgId, userId, lat, lng, label:label||"📍 Location", timestamp:Date.now()
-        });
-        
-        return Response.json({ success:true, messageId:msgId, mapUrl:`https://maps.google.com/?q=${lat},${lng}` }, { headers: cors });
-      }
-
-      
-      // ═══ MESSAGE FORWARDING ═══
-      if (p === "/api/messages/forward" && m === "POST") {
-        const { messageId, fromRoomId, toRoomId, userId } = await request.json() as any;
-        const msg = await env.DB.prepare("SELECT * FROM messages WHERE id=? AND deleted=0").bind(messageId).first();
-        if (!msg) return Response.json({ error:"Message not found" }, { status:404, headers:cors });
-        
-        const newId = crypto.randomUUID();
-        await env.DB.prepare("INSERT INTO messages (id, room_id, user_id, text, type, forwarded_from, created_at) VALUES (?,?,?,?,?,?,?)")
-          .bind(newId, toRoomId, userId, msg.text, msg.type, messageId, Date.now()).run();
-        
-        broadcastToRoom(env, toRoomId, { type:"message", user:userId, text:msg.text, forwarded:true, timestamp:Date.now() });
-        return Response.json({ success:true, newMessageId:newId }, { headers: cors });
-      }
-
-      // ═══ MUTE CONVERSATIONS ═══
-      if (p === "/api/rooms/mute" && m === "POST") {
-        const { roomId, userId, duration } = await request.json() as any;
-        // duration: 0=unmute, 3600000=1h, 28800000=8h, 86400000=forever
-        const until = duration === 0 ? 0 : Date.now() + (duration || 86400000);
-        await env.DB.prepare("INSERT OR REPLACE INTO muted_rooms (room_id, user_id, muted_until) VALUES (?,?,?)")
-          .bind(roomId, userId, until).run();
-        return Response.json({ success:true, roomId, mutedUntil:until||0 }, { headers: cors });
-      }
-      if (p === "/api/rooms/muted" && m === "GET") {
-        const uid = url.searchParams.get("uid")||"";
-        const { results } = await env.DB.prepare("SELECT * FROM muted_rooms WHERE user_id=? AND (muted_until=0 OR muted_until > ?)").bind(uid, Date.now()).all();
-        return Response.json({ muted:results }, { headers: cors });
-      }
-
-      // ═══ STARRED/BOOKMARKED MESSAGES ═══
-      if (p === "/api/messages/star" && m === "POST") {
-        const { messageId, userId } = await request.json() as any;
-        await env.DB.prepare("INSERT OR IGNORE INTO starred_messages (message_id, user_id) VALUES (?,?)").bind(messageId, userId).run();
-        return Response.json({ success:true }, { headers: cors });
-      }
-      if (p === "/api/messages/unstar" && m === "POST") {
-        const { messageId, userId } = await request.json() as any;
-        await env.DB.prepare("DELETE FROM starred_messages WHERE message_id=? AND user_id=?").bind(messageId, userId).run();
-        return Response.json({ success:true }, { headers: cors });
-      }
-      if (p === "/api/messages/starred" && m === "GET") {
-        const uid = url.searchParams.get("uid")||"";
-        const { results } = await env.DB.prepare("SELECT m.* FROM messages m JOIN starred_messages s ON m.id=s.message_id WHERE s.user_id=? ORDER BY m.created_at DESC LIMIT 100").bind(uid).all();
-        return Response.json({ starred:results }, { headers: cors });
-      }
-
-      // ═══ @MENTIONS ═══
-      if (p === "/api/messages/mention" && m === "POST") {
-        const { roomId, userId, text, mentionUsers } = await request.json() as any;
-        const msgId = crypto.randomUUID();
-        await env.DB.prepare("INSERT INTO messages (id, room_id, user_id, text, type, created_at) VALUES (?,?,?,?,?,?)")
-          .bind(msgId, roomId, userId, text, "mention", Date.now()).run();
-        
-        // Notify mentioned users
-        for (const muid of (mentionUsers||[])) {
-          try {
-            const doId = env.CHAT_ROOM.idFromName(`user:${muid}`);
-            const room = env.CHAT_ROOM.get(doId);
-            await room.fetch(new Request("https://internal/signal", {
-              method: "POST",
-              body: JSON.stringify({ type:"mention", messageId:msgId, roomId, mentionedBy:userId, text, timestamp:Date.now() })
-            }));
-          } catch (e) {}
-        }
-        
-        broadcastToRoom(env, roomId, { type:"message", user:userId, text, mentions:mentionUsers, timestamp:Date.now() });
-        return Response.json({ success:true, messageId:msgId }, { headers: cors });
-      }
-
-      // ═══ MARK AS UNREAD ═══
-      if (p === "/api/rooms/unread" && m === "POST") {
-        const { roomId, userId, unread } = await request.json() as any;
-        await env.DB.prepare("INSERT OR REPLACE INTO unread_markers (room_id, user_id, marked_unread) VALUES (?,?,?)")
-          .bind(roomId, userId, unread ? 1 : 0).run();
-        return Response.json({ success:true }, { headers: cors });
-      }
-
-      // ═══ PRIVACY SETTINGS ═══
-      if (p === "/api/privacy" && m === "POST") {
-        const { userId, lastSeen, onlineStatus, profilePhoto, readReceipts } = await request.json() as any;
-        const settings = JSON.stringify({ lastSeen:lastSeen??"everyone", onlineStatus:onlineStatus??"everyone", profilePhoto:profilePhoto??"everyone", readReceipts:readReceipts??true });
-        await env.DB.prepare("INSERT OR REPLACE INTO privacy_settings (user_id, settings) VALUES (?,?)").bind(userId, settings).run();
-        return Response.json({ success:true, settings:JSON.parse(settings) }, { headers: cors });
-      }
-      if (p === "/api/privacy" && m === "GET") {
-        const uid = url.searchParams.get("uid")||"";
-        const ps = await env.DB.prepare("SELECT * FROM privacy_settings WHERE user_id=?").bind(uid).first();
-        return Response.json({ settings:ps?.settings ? JSON.parse(ps.settings as string) : { lastSeen:"everyone", onlineStatus:"everyone", profilePhoto:"everyone", readReceipts:true } }, { headers: cors });
-      }
-
-      // ═══ SESSION MANAGEMENT ═══
-      if (p === "/api/sessions" && m === "GET") {
-        const uid = url.searchParams.get("uid")||"";
-        const { results } = await env.DB.prepare("SELECT * FROM user_sessions WHERE user_id=? AND expires_at > ?").bind(uid, Date.now()).all();
-        return Response.json({ sessions:results }, { headers: cors });
-      }
-      if (p === "/api/sessions/logout" && m === "POST") {
-        const { userId, sessionId } = await request.json() as any;
-        await env.DB.prepare("DELETE FROM user_sessions WHERE id=? AND user_id=?").bind(sessionId, userId).run();
-        return Response.json({ success:true }, { headers: cors });
-      }
-
-      // ═══ MESSAGE REPORT ═══
-      if (p === "/api/messages/report" && m === "POST") {
-        const { messageId, userId, reason } = await request.json() as any;
-        await env.DB.prepare("INSERT INTO reported_messages (message_id, reported_by, reason) VALUES (?,?,?)").bind(messageId, userId, reason||"inappropriate").run();
-        return Response.json({ success:true, message:"Reported. Moderators will review." }, { headers: cors });
-      }
-
-      // ═══ TWO-FACTOR AUTH (2FA) ═══
-      if (p === "/api/auth/2fa/enable" && m === "POST") {
-        const { userId } = await request.json() as any;
-        // Generate TOTP secret
-        const secret = crypto.randomUUID().replace(/-/g,"").substring(0,32);
-        await env.DB.prepare("INSERT OR REPLACE INTO two_factor (user_id, secret, enabled) VALUES (?,?,1)").bind(userId, secret).run();
-        return Response.json({ success:true, secret, qrCode:`otpauth://totp/MeganChat:${userId}?secret=${secret}&issuer=MeganChat` }, { headers: cors });
-      }
-      if (p === "/api/auth/2fa/verify" && m === "POST") {
-        const { userId, code } = await request.json() as any;
-        const tf = await env.DB.prepare("SELECT * FROM two_factor WHERE user_id=?").bind(userId).first();
-        if (!tf) return Response.json({ error:"2FA not enabled" }, { status:400, headers:cors });
-        // Simple verification (in production, use proper TOTP library)
-        return Response.json({ success:true, verified:true }, { headers: cors });
-      }
-
-      // ═══ USER BIO ═══
-      if (p === "/api/profile/bio" && m === "POST") {
-        const { userId, bio } = await request.json() as any;
-        await env.DB.prepare("UPDATE users SET bio=? WHERE uid=?").bind(bio||"", userId).run();
-        return Response.json({ success:true }, { headers: cors });
-      }
-
-      // ═══ DRAFT MESSAGES ═══
-      if (p === "/api/drafts" && m === "POST") {
-        const { roomId, userId, text } = await request.json() as any;
-        await env.DB.prepare("INSERT OR REPLACE INTO drafts (room_id, user_id, text) VALUES (?,?,?)").bind(roomId, userId, text||"").run();
-        return Response.json({ success:true }, { headers: cors });
-      }
-      if (p === "/api/drafts" && m === "GET") {
-        const uid = url.searchParams.get("uid")||"";
-        const { results } = await env.DB.prepare("SELECT * FROM drafts WHERE user_id=?").bind(uid).all();
-        return Response.json({ drafts:results }, { headers: cors });
-      }
-
-      
-      // ═══ REPORT NOTIFICATION (Email Admin) ═══
-      // When user is reported, notify the API key owner
-      async function notifyReport(env: Env, messageId: string, reportedBy: string, reason: string) {
-        const msg = await env.DB.prepare("SELECT * FROM messages WHERE id=?").bind(messageId).first();
-        const reporter = await env.DB.prepare("SELECT username FROM users WHERE uid=?").bind(reportedBy).first();
-        
-        // Find the API key owner for this room
-        const room = await env.DB.prepare("SELECT created_by FROM chat_rooms WHERE id=(SELECT room_id FROM messages WHERE id=?)").bind(messageId).first();
-        if (!room) return;
-        
-        const owner = await env.DB.prepare("SELECT email, username FROM users WHERE uid=?").bind(room.created_by).first();
-        if (!owner?.email) return;
-        
-        // Send email via Firebase or custom SMTP
-        const emailBody = {
-          to: owner.email,
-          subject: `🚨 User Report: ${reporter?.username || 'Someone'} reported a message`,
-          body: `A message was reported by ${reporter?.username || 'Unknown'}.
-
-Reason: ${reason}
-Message: ${(msg?.text as string)?.substring(0, 200)}
-
-Log in to review: https://megan-chat.trackerwanga254.workers.dev/admin`
-        };
-        
-        // Store report notification
-        await env.DB.prepare("INSERT INTO report_notifications (message_id, reported_by, room_owner, reason, email_sent) VALUES (?,?,?,?,1)")
-          .bind(messageId, reportedBy, room.created_by, reason).run();
-      }
-
-      // ═══ TERMS OF SERVICE SYSTEM ═══
-      if (p === "/api/terms" && m === "POST") {
-        const { userId, terms, autoBlockKeywords } = await request.json() as any;
-        await env.DB.prepare("INSERT OR REPLACE INTO developer_terms (user_id, terms_text, auto_block_keywords) VALUES (?,?,?)")
-          .bind(userId, terms||"", JSON.stringify(autoBlockKeywords||[])).run();
-        return Response.json({ success:true, message:"Terms saved. Auto-blocking enabled for specified keywords." }, { headers: cors });
-      }
-
-      if (p === "/api/terms" && m === "GET") {
-        const uid = url.searchParams.get("uid")||"";
-        const terms = await env.DB.prepare("SELECT * FROM developer_terms WHERE user_id=?").bind(uid).first();
-        return Response.json({ terms }, { headers: cors });
-      }
-
-      // Updated report endpoint — now checks terms + auto-blocks + notifies
-      if (p === "/api/messages/report" && m === "POST") {
-        const { messageId, userId, reason } = await request.json() as any;
-        
-        // Store report
-        await env.DB.prepare("INSERT INTO reported_messages (message_id, reported_by, reason) VALUES (?,?,?)")
-          .bind(messageId, userId, reason||"inappropriate").run();
-        
-        // Get the message
-        const msg = await env.DB.prepare("SELECT m.*, r.created_by as room_owner FROM messages m JOIN chat_rooms r ON m.room_id=r.id WHERE m.id=?")
-          .bind(messageId).first();
-        
-        // Check developer's terms for auto-block keywords
-        if (msg) {
-          const devTerms = await env.DB.prepare("SELECT * FROM developer_terms WHERE user_id=?").bind(msg.room_owner).first();
-          if (devTerms) {
-            const keywords = JSON.parse(devTerms.auto_block_keywords as string || "[]");
-            const msgText = (msg.text as string || "").toLowerCase();
-            const matched = keywords.find((kw: string) => msgText.includes(kw.toLowerCase()));
-            
-            if (matched) {
-              // Auto-block the message sender
-              await env.DB.prepare("UPDATE messages SET deleted=1, deleted_at=? WHERE id=?").bind(Date.now(), messageId).run();
-              broadcastToRoom(env, msg.room_id, { type:"message_deleted", messageId, userId:"system", reason:`Violated terms: ${matched}` });
-              
-              // Notify room
-              await env.DB.prepare("INSERT INTO messages (id, room_id, user_id, text, type, created_at) VALUES (?,?,?,?,?,?)")
-                .bind(crypto.randomUUID(), msg.room_id, "system", `⚠️ Message removed: violated community terms (${matched})`, "system", Date.now()).run();
-            }
-          }
-          
-          // Send email notification
-          await notifyReport(env, messageId, userId, reason||"inappropriate");
-        }
-        
-        return Response.json({ success:true, message:"Reported. Moderators will review." }, { headers: cors });
-      }
-
-      // ═══ MULTI-DEVICE LINKING ═══
-      // Generate pairing code for new device
-      if (p === "/api/devices/pair" && m === "POST") {
-        const { userId } = await request.json() as any;
-        const pairCode = String(Math.floor(100000 + Math.random() * 900000));
-        const expires = Date.now() + 300000; // 5 minutes
-        
-        await env.DB.prepare("INSERT OR REPLACE INTO device_pairing (user_id, pair_code, expires_at) VALUES (?,?,?)")
-          .bind(userId, pairCode, expires).run();
-        
-        return Response.json({ success:true, pairCode, expiresIn:300 }, { headers: cors });
-      }
-
-      // Link new device with pairing code
-      if (p === "/api/devices/link" && m === "POST") {
-        const { userId, pairCode, deviceName, deviceType } = await request.json() as any;
-        
-        const pairing = await env.DB.prepare("SELECT * FROM device_pairing WHERE user_id=? AND pair_code=? AND expires_at > ?")
-          .bind(userId, pairCode, Date.now()).first();
-        if (!pairing) return Response.json({ error:"Invalid or expired pairing code" }, { status:400, headers:cors });
-        
-        await env.DB.prepare("DELETE FROM device_pairing WHERE user_id=?").bind(userId).run();
-        
-        const deviceId = crypto.randomUUID();
-        await env.DB.prepare("INSERT INTO linked_devices (id, user_id, device_name, device_type, linked_at) VALUES (?,?,?,?,?)")
-          .bind(deviceId, userId, deviceName||"Unknown Device", deviceType||"mobile", Date.now()).run();
-        
-        return Response.json({ success:true, deviceId, message:"Device linked! Messages will sync across all devices." }, { headers: cors });
-      }
-
-      // Get linked devices
-      if (p === "/api/devices" && m === "GET") {
-        const uid = url.searchParams.get("uid")||"";
-        const { results } = await env.DB.prepare("SELECT * FROM linked_devices WHERE user_id=? ORDER BY linked_at DESC").bind(uid).all();
-        return Response.json({ devices:results }, { headers: cors });
-      }
-
-      // Unlink device
-      if (p === "/api/devices/unlink" && m === "POST") {
-        const { userId, deviceId } = await request.json() as any;
-        await env.DB.prepare("DELETE FROM linked_devices WHERE id=? AND user_id=?").bind(deviceId, userId).run();
-        return Response.json({ success:true }, { headers: cors });
-      }
-
-      
-      // ═══════════════════════════════════════════════════════
-      // ADMIN ENDPOINTS (Master Key — no API key needed)
-      // ═══════════════════════════════════════════════════════
-      
-      const MASTER_KEY = "megan_chat_master_admin_2026";
-      const isAdmin = url.searchParams.get("master_key") === MASTER_KEY || request.headers.get("x-master-key") === MASTER_KEY;
-
-      // Admin: View all users
-      if (p === "/admin/users" && isAdmin && m === "GET") {
-        const { results } = await env.DB.prepare("SELECT uid, username, display_name, email, phone, megan_id, tier, phone_verified, status, created_at FROM users ORDER BY created_at DESC LIMIT 100").all();
-        return Response.json({ total:results.length, users:results }, { headers: cors });
-      }
-
-      // Admin: View all rooms
-      if (p === "/admin/rooms" && isAdmin && m === "GET") {
-        const { results } = await env.DB.prepare("SELECT r.*, COUNT(m.room_id) as member_count FROM chat_rooms r LEFT JOIN room_members m ON r.id=m.room_id GROUP BY r.id ORDER BY r.created_at DESC LIMIT 100").all();
-        return Response.json({ rooms:results }, { headers: cors });
-      }
-
-      // Admin: View all messages
-      if (p === "/admin/messages" && isAdmin && m === "GET") {
-        const { results } = await env.DB.prepare("SELECT m.*, u.username FROM messages m JOIN users u ON m.user_id=u.uid ORDER BY m.created_at DESC LIMIT 200").all();
-        return Response.json({ messages:results }, { headers: cors });
-      }
-
-      // Admin: View all API keys
-      if (p === "/admin/keys" && isAdmin && m === "GET") {
-        const { results } = await env.DB.prepare("SELECT k.*, u.username, u.email FROM api_keys k JOIN users u ON k.user_id=u.uid ORDER BY k.created_at DESC").all();
-        return Response.json({ keys:results }, { headers: cors });
-      }
-
-      // Admin: View reports
-      if (p === "/admin/reports" && isAdmin && m === "GET") {
-        const { results } = await env.DB.prepare("SELECT r.*, u.username as reporter_name FROM reported_messages r JOIN users u ON r.reported_by=u.uid ORDER BY r.created_at DESC LIMIT 100").all();
-        return Response.json({ reports:results }, { headers: cors });
-      }
-
-      // Admin: Delete any user
-      if (p === "/admin/users/delete" && isAdmin && m === "POST") {
-        const { uid } = await request.json() as any;
-        await env.DB.prepare("DELETE FROM users WHERE uid=?").bind(uid).run();
-        await env.DB.prepare("DELETE FROM messages WHERE user_id=?").bind(uid).run();
-        await env.DB.prepare("DELETE FROM room_members WHERE user_id=?").bind(uid).run();
-        await env.DB.prepare("DELETE FROM friends WHERE user_uid=? OR friend_uid=?").bind(uid, uid).run();
-        return Response.json({ success:true, message:"User and all data deleted" }, { headers: cors });
-      }
-
-      // Admin: Delete any room
-      if (p === "/admin/rooms/delete" && isAdmin && m === "POST") {
-        const { roomId } = await request.json() as any;
-        await env.DB.prepare("DELETE FROM chat_rooms WHERE id=?").bind(roomId).run();
-        await env.DB.prepare("DELETE FROM messages WHERE room_id=?").bind(roomId).run();
-        await env.DB.prepare("DELETE FROM room_members WHERE room_id=?").bind(roomId).run();
-        return Response.json({ success:true, message:"Room and all messages deleted" }, { headers: cors });
-      }
-
-      // Admin: Grant coins/tier to user
-      if (p === "/admin/users/upgrade" && isAdmin && m === "POST") {
-        const { username, tier, coins } = await request.json() as any;
-        const updates: any = {};
-        if (tier) updates.tier = tier;
-        if (coins) updates.mgc_balance = coins;
-        await env.DB.prepare("UPDATE users SET " + Object.keys(updates).map(k => `${k}=?`).join(",") + " WHERE username=?").bind(...Object.values(updates), username).run();
-        return Response.json({ success:true, message:`${username} updated`, updates }, { headers: cors });
-      }
-
-      // Admin: View stats
-      if (p === "/admin/stats" && isAdmin && m === "GET") {
-        const users = await env.DB.prepare("SELECT COUNT(*) as count FROM users").first();
-        const rooms = await env.DB.prepare("SELECT COUNT(*) as count FROM chat_rooms").first();
-        const messages = await env.DB.prepare("SELECT COUNT(*) as count FROM messages").first();
-        const keys = await env.DB.prepare("SELECT COUNT(*) as count FROM api_keys").first();
-        const reports = await env.DB.prepare("SELECT COUNT(*) as count FROM reported_messages").first();
-        
-        return Response.json({
-          stats: {
-            totalUsers: users?.count || 0,
-            totalRooms: rooms?.count || 0,
-            totalMessages: messages?.count || 0,
-            totalApiKeys: keys?.count || 0,
-            pendingReports: reports?.count || 0,
-          }
-        }, { headers: cors });
-      }
-
-      // Admin: Broadcast to all users
-      if (p === "/admin/broadcast" && isAdmin && m === "POST") {
-        const { message } = await request.json() as any;
-        // Store as system announcement
-        await env.DB.prepare("INSERT INTO messages (id, room_id, user_id, text, type, created_at) VALUES (?,'global','admin',?,'announcement',?)")
-          .bind(crypto.randomUUID(), message, Date.now()).run();
-        return Response.json({ success:true, message:"Broadcast sent to all users" }, { headers: cors });
-      }
-
-      // Admin: View economy (MGC coins in circulation)
-      if (p === "/admin/economy" && isAdmin && m === "GET") {
-        const { results } = await env.DB.prepare("SELECT SUM(mgc_balance) as total_coins, AVG(mgc_balance) as avg_coins, COUNT(*) as total_users FROM users").all();
-        return Response.json({ economy:results?.[0] }, { headers: cors });
-      }
-
-      
-      // Admin: Search/filter users
-      if (p === "/admin/users/search" && isAdmin && m === "GET") {
-        const q = url.searchParams.get("q")||"";
-        const filter = url.searchParams.get("filter")||"all"; // all, verified, unverified, online
-        let query = "SELECT * FROM users WHERE (username LIKE ? OR email LIKE ? OR phone LIKE ? OR megan_id LIKE ?)";
-        const params: any[] = [`%${q}%`,`%${q}%`,`%${q}%`,`%${q}%`];
-        if (filter === "verified") { query += " AND phone_verified=1"; }
-        if (filter === "unverified") { query += " AND phone_verified=0"; }
-        if (filter === "online") { query += " AND status='online'"; }
-        query += " ORDER BY created_at DESC LIMIT 100";
-        const { results } = await env.DB.prepare(query).bind(...params).all();
-        return Response.json({ users:results }, { headers: cors });
-      }
-
-      // Admin: View single user details
-      if (p.startsWith("/admin/users/") && !p.includes("/delete") && !p.includes("/upgrade") && !p.includes("/suspend") && !p.includes("/search") && isAdmin && m === "GET") {
-        const uid = p.split("/")[3];
-        const user = await env.DB.prepare("SELECT * FROM users WHERE uid=?").bind(uid).first();
-        if (!user) return Response.json({ error:"Not found" }, { status:404, headers: cors });
-        const messages = await env.DB.prepare("SELECT COUNT(*) as count FROM messages WHERE user_id=?").bind(uid).first();
-        const rooms = await env.DB.prepare("SELECT r.name FROM chat_rooms r JOIN room_members m ON r.id=m.room_id WHERE m.user_id=?").bind(uid).all();
-        const devices = await env.DB.prepare("SELECT * FROM linked_devices WHERE user_id=?").bind(uid).all();
-        return Response.json({ user, messageCount:messages?.count||0, rooms:rooms.results, devices:devices.results }, { headers: cors });
-      }
-
-      // Admin: Suspend/unsuspend user
-      if (p === "/admin/users/suspend" && isAdmin && m === "POST") {
-        const { uid, suspend } = await request.json() as any;
-        await env.DB.prepare("UPDATE users SET suspended=?, suspended_at=? WHERE uid=?").bind(suspend?1:0, suspend?Date.now():null, uid).run();
-        // Force logout if suspended
-        if (suspend) {
-          await env.DB.prepare("DELETE FROM user_sessions WHERE user_id=?").bind(uid).run();
-          try {
-            const doId = env.CHAT_ROOM.idFromName(`user:${uid}`);
-            const room = env.CHAT_ROOM.get(doId);
-            await room.fetch(new Request("https://internal/signal", { method:"POST", body:JSON.stringify({ type:"force_logout" }) }));
-          } catch (e) {}
-        }
-        return Response.json({ success:true, message:`User ${suspend?'suspended':'unsuspended'}` }, { headers: cors });
-      }
-
-      // Admin: Force logout user
-      if (p === "/admin/users/logout" && isAdmin && m === "POST") {
-        const { uid } = await request.json() as any;
-        await env.DB.prepare("DELETE FROM user_sessions WHERE user_id=?").bind(uid).run();
-        try {
-          const doId = env.CHAT_ROOM.idFromName(`user:${uid}`);
-          const room = env.CHAT_ROOM.get(doId);
-          await room.fetch(new Request("https://internal/signal", { method:"POST", body:JSON.stringify({ type:"force_logout" }) }));
-        } catch (e) {}
-        return Response.json({ success:true, message:"User logged out from all devices" }, { headers: cors });
-      }
-
-      // Admin: View active connections
-      if (p === "/admin/connections" && isAdmin && m === "GET") {
-        const { results } = await env.DB.prepare("SELECT uid, username, status, last_seen FROM users WHERE status='online' OR last_seen > ?").bind(Date.now()-300000).all();
-        return Response.json({ online:results.filter((u:any)=>u.status==='online').length, recent:results }, { headers: cors });
-      }
-
-      // Admin: System logs (admin action audit trail)
-      if (p === "/admin/logs" && isAdmin && m === "GET") {
-        // Store admin actions in a simple log
-        const { results } = await env.DB.prepare("SELECT * FROM admin_logs ORDER BY created_at DESC LIMIT 100").all();
-        return Response.json({ logs:results }, { headers: cors });
-      }
-
-      // Admin: Export user data (GDPR)
-      if (p === "/admin/users/export" && isAdmin && m === "POST") {
-        const { uid } = await request.json() as any;
-        const user = await env.DB.prepare("SELECT * FROM users WHERE uid=?").bind(uid).first();
-        const messages = await env.DB.prepare("SELECT * FROM messages WHERE user_id=? ORDER BY created_at DESC LIMIT 1000").bind(uid).all();
-        const friends = await env.DB.prepare("SELECT u.username FROM friends f JOIN users u ON f.friend_uid=u.uid WHERE f.user_uid=?").bind(uid).all();
-        const rooms = await env.DB.prepare("SELECT r.name FROM chat_rooms r JOIN room_members m ON r.id=m.room_id WHERE m.user_id=?").bind(uid).all();
-        return Response.json({ export: { user, messages:messages.results, friends:friends.results, rooms:rooms.results, exportedAt:new Date().toISOString() } }, { headers: cors });
-      }
-
-      
-      // ═══ PASSWORD RESET ═══
-      if (p === "/api/auth/reset-password" && m === "POST") {
-        const { email } = await request.json() as any;
-        if (!email) return Response.json({ error:"email required" }, { status:400, headers:cors });
-        
-        try {
-          await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=${FB_KEY}`, {
-            method:"POST", headers:{"Content-Type":"application/json"},
-            body:JSON.stringify({ requestType:"PASSWORD_RESET", email })
-          });
-          return Response.json({ success:true, message:"Password reset email sent. Check your inbox." }, { headers: cors });
-        } catch (e: any) {
-          return Response.json({ error:"Failed to send reset email" }, { status:500, headers:cors });
-        }
-      }
-
-      // ═══ CONTACT SYNC (Find friends from phone contacts) ═══
-      if (p === "/api/contacts/sync" && m === "POST") {
-        const { userId, contacts } = await request.json() as any;
-        if (!userId || !contacts) return Response.json({ error:"userId and contacts required" }, { status:400, headers:cors });
-        
-        // contacts = ["+254712345678", "+254723456789", ...]
-        const found: any[] = [];
-        for (const phone of (contacts as string[])) {
-          const user = await env.DB.prepare("SELECT uid, username, display_name, megan_id, avatar_url, status FROM users WHERE phone=? AND phone_verified=1").bind(phone).first();
-          if (user) {
-            // Check if already friends
-            const isFriend = await env.DB.prepare("SELECT 1 FROM friends WHERE user_uid=? AND friend_uid=?").bind(userId, user.uid).first();
-            found.push({ ...user, isFriend: !!isFriend });
-          }
-        }
-        
-        return Response.json({ success:true, matched:found.length, contacts:found }, { headers: cors });
-      }
-
-      // ═══ ROOM INVITE LINKS ═══
-      if (p === "/api/rooms/invite" && m === "POST") {
-        const { roomId, userId, expiresIn } = await request.json() as any;
-        const code = Array.from(crypto.randomUUID().replace(/-/g,'')).slice(0, 10);
-        const expires = expiresIn ? Date.now() + (expiresIn * 1000) : 0; // 0 = never expires
-        
-        await env.DB.prepare("INSERT OR REPLACE INTO room_invites (room_id, created_by, invite_code, expires_at) VALUES (?,?,?,?)")
-          .bind(roomId, userId, code, expires).run();
-        
-        return Response.json({ success:true, inviteCode:code, inviteLink:`https://megan-chat.trackerwanga254.workers.dev/join/${code}`, expiresAt:expires||null }, { headers: cors });
-      }
-
-      // Join room via invite link
-      if (p.startsWith("/api/join/") && m === "POST") {
-        const code = p.split("/")[3];
-        const { userId } = await request.json() as any;
-        
-        const invite = await env.DB.prepare("SELECT * FROM room_invites WHERE invite_code=? AND (expires_at=0 OR expires_at > ?)").bind(code, Date.now()).first();
-        if (!invite) return Response.json({ error:"Invalid or expired invite link" }, { status:404, headers:cors });
-        
-        // Check if not already a member
-        const existing = await env.DB.prepare("SELECT 1 FROM room_members WHERE room_id=? AND user_id=?").bind(invite.room_id, userId).first();
-        if (existing) return Response.json({ error:"Already a member" }, { status:400, headers:cors });
-        
-        await env.DB.prepare("INSERT OR IGNORE INTO room_members (room_id, user_id) VALUES (?,?)").bind(invite.room_id, userId).run();
-        
-        const room = await env.DB.prepare("SELECT * FROM chat_rooms WHERE id=?").bind(invite.room_id).first();
-        return Response.json({ success:true, room, message:"Joined successfully!" }, { headers: cors });
-      }
-
-      // ═══ MESSAGE PAGINATION ═══
-      if (p.startsWith("/api/rooms/") && p.endsWith("/messages") && m === "GET") {
-        const roomId = p.split("/")[3];
-        const before = parseInt(url.searchParams.get("before")||"0"); // timestamp
-        const limit = Math.min(parseInt(url.searchParams.get("limit")||"50"), 200);
-        
-        let query = "SELECT m.*, u.username, u.display_name FROM messages m JOIN users u ON m.user_id=u.uid WHERE m.room_id=? AND m.deleted=0";
-        const params: any[] = [roomId];
-        
-        if (before > 0) { query += " AND m.created_at < ?"; params.push(before); }
-        query += " ORDER BY m.created_at DESC LIMIT ?"; params.push(limit);
-        
-        const { results } = await env.DB.prepare(query).bind(...params).all();
-        const hasMore = results.length === limit;
-        
-        return Response.json({ messages:results.reverse(), hasMore, oldestTimestamp:results.length>0?results[results.length-1].created_at:null }, { headers: cors });
-      }
-
-      // ═══ GIF SEARCH (via Giphy) ═══
-      if (p === "/api/gifs/search" && m === "GET") {
-        const q = url.searchParams.get("q")||"trending";
-        const limit = Math.min(parseInt(url.searchParams.get("limit")||"20"), 50);
-        
-        // Use Giphy public API or fallback to Tenor
-        try {
-          const res = await fetch(`https://api.giphy.com/v1/gifs/search?api_key=dc6zaTOxFJmzC&q=${encodeURIComponent(q)}&limit=${limit}&rating=g`);
-          const data = await res.json() as any;
-          const gifs = (data.data||[]).map((g:any) => ({
-            id: g.id,
-            url: g.images?.fixed_height?.url,
-            preview: g.images?.preview_gif?.url,
-            title: g.title
-          }));
-          return Response.json({ gifs }, { headers: cors });
-        } catch (e) {
-          // Fallback: return trending from Tenor
-          try {
-            const res = await fetch(`https://g.tenor.com/v1/search?q=${encodeURIComponent(q)}&key=LIVDSRZULELA&limit=${limit}`);
-            const data = await res.json() as any;
-            const gifs = (data.results||[]).map((g:any) => ({
-              id: g.id,
-              url: g.media?.[0]?.gif?.url,
-              preview: g.media?.[0]?.tinygif?.url,
-              title: g.title
-            }));
-            return Response.json({ gifs }, { headers: cors });
-          } catch (e2) {
-            return Response.json({ gifs:[], message:"GIF search unavailable" }, { headers: cors });
-          }
-        }
-      }
-
-      // ═══ NOTIFICATION PREFERENCES ═══
-      if (p === "/api/notifications/preferences" && m === "POST") {
-        const { userId, messageNotifications, callNotifications, mentionNotifications, groupNotifications, storyNotifications } = await request.json() as any;
-        const prefs = JSON.stringify({ messageNotifications:messageNotifications??true, callNotifications:callNotifications??true, mentionNotifications:mentionNotifications??true, groupNotifications:groupNotifications??true, storyNotifications:storyNotifications??false });
-        await env.DB.prepare("INSERT OR REPLACE INTO notification_prefs (user_id, preferences) VALUES (?,?)").bind(userId, prefs).run();
-        return Response.json({ success:true, preferences:JSON.parse(prefs) }, { headers: cors });
-      }
-      if (p === "/api/notifications/preferences" && m === "GET") {
-        const uid = url.searchParams.get("uid")||"";
-        const prefs = await env.DB.prepare("SELECT * FROM notification_prefs WHERE user_id=?").bind(uid).first();
-        return Response.json({ preferences:prefs?.preferences ? JSON.parse(prefs.preferences as string) : { messageNotifications:true, callNotifications:true, mentionNotifications:true, groupNotifications:true, storyNotifications:false } }, { headers: cors });
-      }
-
-      // ═══ DELETE ACCOUNT (Self-Service) ═══
-      if (p === "/api/auth/delete-account" && m === "POST") {
-        const { userId, confirmation } = await request.json() as any;
-        if (confirmation !== "DELETE") return Response.json({ error:"Type 'DELETE' to confirm" }, { status:400, headers:cors });
-        
-        // Delete everything for this user
-        await env.DB.prepare("DELETE FROM messages WHERE user_id=?").bind(userId).run();
-        await env.DB.prepare("DELETE FROM room_members WHERE user_id=?").bind(userId).run();
-        await env.DB.prepare("DELETE FROM friends WHERE user_uid=? OR friend_uid=?").bind(userId, userId).run();
-        await env.DB.prepare("DELETE FROM linked_devices WHERE user_id=?").bind(userId).run();
-        await env.DB.prepare("DELETE FROM user_sessions WHERE user_id=?").bind(userId).run();
-        await env.DB.prepare("DELETE FROM stories WHERE user_id=?").bind(userId).run();
-        await env.DB.prepare("DELETE FROM api_keys WHERE user_id=?").bind(userId).run();
-        await env.DB.prepare("DELETE FROM users WHERE uid=?").bind(userId).run();
-        
-        return Response.json({ success:true, message:"Account permanently deleted. All data removed." }, { headers: cors });
-      }
-
-      
-      // ═══ JOIN PAGE (Web) ═══
-      if (p.startsWith("/join/") && m === "GET") {
-        const code = p.split("/")[2];
-        const invite = await env.DB.prepare("SELECT r.name, r.id, u.username as creator FROM room_invites i JOIN chat_rooms r ON i.room_id=r.id JOIN users u ON i.created_by=u.uid WHERE i.invite_code=? AND (i.expires_at=0 OR i.expires_at > ?)").bind(code, Date.now()).first();
-        
-        if (!invite) {
-          return new Response(`<!DOCTYPE html><html><head><title>Invalid Link</title><meta name="viewport" content="width=device-width,initial-scale=1"><style>body{background:#0a0a0f;color:#f0f0ff;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center}span{color:#6C63FF}</style></head><body><div><h1>❌ Link Expired</h1><p>This invite link is invalid or has expired.</p><p>Ask the group admin for a new link.</p></div></body></html>`, { headers: {"Content-Type":"text/html"} });
-        }
-        
-        const deepLink = url.searchParams.get("app") || "";
-        
-        return new Response(`<!DOCTYPE html>
-<html><head>
-  <title>Join ${invite.name}</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta property="og:title" content="Join ${invite.name} on Megan Chat">
-  <meta property="og:description" content="You've been invited by ${invite.creator}">
-  <style>
-    *{margin:0;padding:0;box-sizing:border-box}
-    body{background:#0a0a0f;color:#f0f0ff;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;text-align:center}
-    .card{background:#13131a;border:1px solid #2a2a3a;border-radius:16px;padding:40px;max-width:400px}
-    h1{font-size:24px;margin-bottom:8px}
-    h1 span{color:#6C63FF}
-    p{color:#8888aa;margin-bottom:20px;font-size:14px}
-    .btn{display:inline-block;padding:14px 32px;background:#6C63FF;color:white;border:none;border-radius:10px;font-size:16px;font-weight:600;cursor:pointer;text-decoration:none}
-    .btn:hover{background:#7B73FF}
-    .sub{font-size:12px;color:#555;margin-top:16px}
-    ${deepLink ? '.app-btn{display:none}' : ''}
-  </style>
-</head><body>
-  <div class="card">
-    <h1>Join <span>${invite.name}</span></h1>
-    <p>You've been invited by <strong>${invite.creator}</strong> to join this group on Megan Chat.</p>
-    ${deepLink ? `<a href="${deepLink}://join/${code}" class="btn">Open in App</a>` : '<button class="btn" onclick="joinGroup()">Join Group</button>'}
-    <p class="sub">Megan Chat • Powered by Falcon Tech</p>
-  </div>
-  <script>
-    async function joinGroup() {
-      const btn = document.querySelector('.btn');
-      btn.textContent = 'Joining...';
-      btn.disabled = true;
-      try {
-        const res = await fetch('/api/join/${code}', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({userId:localStorage.getItem('megan_uid')||prompt('Enter your user ID:')})});
-        const data = await res.json();
-        if (data.success) {
-          btn.textContent = '✅ Joined!';
-          btn.style.background = '#00E5A0';
-          setTimeout(() => { if('${deepLink}') window.location.href='${deepLink}://room/${invite.id}'; }, 1000);
-        } else {
-          btn.textContent = '❌ ' + (data.error || 'Failed');
-          btn.style.background = '#ff4444';
-        }
-      } catch(e) {
-        btn.textContent = '❌ Connection Error';
-        btn.style.background = '#ff4444';
-      }
-    }
-  </script>
-</body></html>`, { headers: {"Content-Type":"text/html"} });
-      }
-
-      
-      
-      
-      
-      
-      // Landing page
-      if (p === "/" && m === "GET") {
-        const html = atob("PCFET0NUWVBFIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CiAgPG1ldGEgY2hhcnNldD0iVVRGLTgiPgogIDxtZXRhIG5hbWU9InZpZXdwb3J0IiBjb250ZW50PSJ3aWR0aD1kZXZpY2Utd2lkdGgsIGluaXRpYWwtc2NhbGU9MS4wIj4KICA8dGl0bGU+TWVnYW4gQ2hhdCDigJQgQnVpbGQgQ2hhdCBBcHBzIGluIE1pbnV0ZXM8L3RpdGxlPgogIDxzdHlsZT4KICAgICp7bWFyZ2luOjA7cGFkZGluZzowO2JveC1zaXppbmc6Ym9yZGVyLWJveH0KICAgIGJvZHl7YmFja2dyb3VuZDojMGEwYTBmO2NvbG9yOiNmMGYwZmY7Zm9udC1mYW1pbHk6LWFwcGxlLXN5c3RlbSxCbGlua01hY1N5c3RlbUZvbnQsJ1NlZ29lIFVJJyxSb2JvdG8sc2Fucy1zZXJpZjtsaW5lLWhlaWdodDoxLjZ9CiAgICAuZ3JhZGllbnQtdGV4dHtiYWNrZ3JvdW5kOmxpbmVhci1ncmFkaWVudCgxMzVkZWcsIzZDNjNGRiwjMDBFNUEwKTstd2Via2l0LWJhY2tncm91bmQtY2xpcDp0ZXh0Oy13ZWJraXQtdGV4dC1maWxsLWNvbG9yOnRyYW5zcGFyZW50O2JhY2tncm91bmQtY2xpcDp0ZXh0fQogICAgbmF2e3Bvc2l0aW9uOmZpeGVkO3RvcDowO3dpZHRoOjEwMCU7cGFkZGluZzoxNnB4IDMycHg7YmFja2dyb3VuZDpyZ2JhKDEwLDEwLDE1LDAuOTUpO2JhY2tkcm9wLWZpbHRlcjpibHVyKDEwcHgpO2JvcmRlci1ib3R0b206MXB4IHNvbGlkIHJnYmEoMjU1LDI1NSwyNTUsMC4wNSk7ei1pbmRleDoxMDAwO2Rpc3BsYXk6ZmxleDtqdXN0aWZ5LWNvbnRlbnQ6c3BhY2UtYmV0d2VlbjthbGlnbi1pdGVtczpjZW50ZXJ9CiAgICBuYXYgLmxvZ297Zm9udC1zaXplOjIycHg7Zm9udC13ZWlnaHQ6ODAwfS5uYXYtbGlua3N7ZGlzcGxheTpmbGV4O2dhcDoyNHB4O2FsaWduLWl0ZW1zOmNlbnRlcn0KICAgIC5uYXYtbGlua3MgYXtjb2xvcjojODg4OGFhO3RleHQtZGVjb3JhdGlvbjpub25lO2ZvbnQtc2l6ZToxNHB4fQogICAgLm5hdi1saW5rcyBhOmhvdmVye2NvbG9yOiNmZmZ9CiAgICAuYnRue3BhZGRpbmc6MTBweCAyNHB4O2JvcmRlci1yYWRpdXM6MTBweDtmb250LXdlaWdodDo2MDA7Zm9udC1zaXplOjE0cHg7Y3Vyc29yOnBvaW50ZXI7dGV4dC1kZWNvcmF0aW9uOm5vbmU7ZGlzcGxheTppbmxpbmUtYmxvY2t9CiAgICAuYnRuLXByaW1hcnl7YmFja2dyb3VuZDojNkM2M0ZGO2NvbG9yOiNmZmZ9LmJ0bi1wcmltYXJ5OmhvdmVye2JhY2tncm91bmQ6IzdCNzNGRn0KICAgIC5idG4tb3V0bGluZXtib3JkZXI6MXB4IHNvbGlkIHJnYmEoMjU1LDI1NSwyNTUsMC4yKTtjb2xvcjojZmZmO2JhY2tncm91bmQ6dHJhbnNwYXJlbnR9LmJ0bi1vdXRsaW5lOmhvdmVye2JvcmRlci1jb2xvcjojNkM2M0ZGfQogICAgLmhlcm97bWluLWhlaWdodDoxMDB2aDtkaXNwbGF5OmZsZXg7YWxpZ24taXRlbXM6Y2VudGVyO2p1c3RpZnktY29udGVudDpjZW50ZXI7dGV4dC1hbGlnbjpjZW50ZXI7cGFkZGluZzoxMjBweCAyNHB4IDYwcHh9CiAgICAuaGVyby1jb250ZW50e21heC13aWR0aDo4MDBweH0KICAgIC5oZXJvIGgxe2ZvbnQtc2l6ZTpjbGFtcCgzNnB4LDZ2dyw2NHB4KTtmb250LXdlaWdodDo4MDA7bGluZS1oZWlnaHQ6MS4xO21hcmdpbi1ib3R0b206MjBweH0KICAgIC5oZXJvIHB7Zm9udC1zaXplOmNsYW1wKDE2cHgsMnZ3LDIwcHgpO2NvbG9yOiM4ODg4YWE7bWFyZ2luLWJvdHRvbTozNnB4fQogICAgLmhlcm8tYnV0dG9uc3tkaXNwbGF5OmZsZXg7Z2FwOjE2cHg7anVzdGlmeS1jb250ZW50OmNlbnRlcjtmbGV4LXdyYXA6d3JhcH0KICAgIC5jb2RlLWJsb2Nre2JhY2tncm91bmQ6IzEzMTMxYTtib3JkZXI6MXB4IHNvbGlkICMyYTJhM2E7Ym9yZGVyLXJhZGl1czoxMnB4O3BhZGRpbmc6MjRweDt0ZXh0LWFsaWduOmxlZnQ7bWF4LXdpZHRoOjYwMHB4O21hcmdpbjo0MHB4IGF1dG8gMDtvdmVyZmxvdy14OmF1dG99CiAgICAuY29kZS1ibG9jayBwcmV7Y29sb3I6Izg4ODhhYTtmb250LXNpemU6MTNweDtmb250LWZhbWlseTptb25vc3BhY2U7bGluZS1oZWlnaHQ6MS44fQogICAgLmt3e2NvbG9yOiM2QzYzRkZ9LnN0cntjb2xvcjojMDBFNUEwfS5jbXtjb2xvcjojNTU1fQogICAgLmZlYXR1cmVze3BhZGRpbmc6ODBweCAyNHB4O21heC13aWR0aDoxMjAwcHg7bWFyZ2luOjAgYXV0b30KICAgIC5mZWF0dXJlcyBoMnt0ZXh0LWFsaWduOmNlbnRlcjtmb250LXNpemU6Y2xhbXAoMjhweCw0dncsNDBweCk7bWFyZ2luLWJvdHRvbToxNnB4fQogICAgLmZlYXR1cmVzIC5zdWJ0aXRsZXt0ZXh0LWFsaWduOmNlbnRlcjtjb2xvcjojODg4OGFhO21hcmdpbi1ib3R0b206NDhweH0KICAgIC5mZWF0dXJlcy1ncmlke2Rpc3BsYXk6Z3JpZDtncmlkLXRlbXBsYXRlLWNvbHVtbnM6cmVwZWF0KGF1dG8tZml0LG1pbm1heCgyODBweCwxZnIpKTtnYXA6MjRweH0KICAgIC5mZWF0dXJlLWNhcmR7YmFja2dyb3VuZDojMTMxMzFhO2JvcmRlcjoxcHggc29saWQgIzFhMWEyNDtib3JkZXItcmFkaXVzOjE2cHg7cGFkZGluZzozMnB4fQogICAgLmZlYXR1cmUtY2FyZDpob3Zlcntib3JkZXItY29sb3I6IzZDNjNGRn0KICAgIC5mZWF0dXJlLWljb257Zm9udC1zaXplOjM2cHg7bWFyZ2luLWJvdHRvbToxNnB4fQogICAgLmZlYXR1cmUtY2FyZCBoM3tmb250LXNpemU6MThweDttYXJnaW4tYm90dG9tOjhweH0KICAgIC5mZWF0dXJlLWNhcmQgcHtjb2xvcjojODg4OGFhO2ZvbnQtc2l6ZToxNHB4fQogICAgLnByaWNpbmd7cGFkZGluZzo4MHB4IDI0cHg7bWF4LXdpZHRoOjEyMDBweDttYXJnaW46MCBhdXRvO3RleHQtYWxpZ246Y2VudGVyfQogICAgLnByaWNpbmcgaDJ7Zm9udC1zaXplOmNsYW1wKDI4cHgsNHZ3LDQwcHgpO21hcmdpbi1ib3R0b206MTZweH0KICAgIC5wcmljaW5nLWdyaWR7ZGlzcGxheTpncmlkO2dyaWQtdGVtcGxhdGUtY29sdW1uczpyZXBlYXQoYXV0by1maXQsbWlubWF4KDI1MHB4LDFmcikpO2dhcDoyNHB4O21hcmdpbi10b3A6NDhweH0KICAgIC5wcmljZS1jYXJke2JhY2tncm91bmQ6IzEzMTMxYTtib3JkZXI6MXB4IHNvbGlkICMxYTFhMjQ7Ym9yZGVyLXJhZGl1czoxNnB4O3BhZGRpbmc6NDBweCAzMnB4O3RleHQtYWxpZ246Y2VudGVyO3Bvc2l0aW9uOnJlbGF0aXZlfQogICAgLnByaWNlLWNhcmQucG9wdWxhcntib3JkZXItY29sb3I6IzZDNjNGRn0KICAgIC5wcmljZS1jYXJkLnBvcHVsYXI6OmJlZm9yZXtjb250ZW50OidQT1BVTEFSJztwb3NpdGlvbjphYnNvbHV0ZTt0b3A6LTEycHg7bGVmdDo1MCU7dHJhbnNmb3JtOnRyYW5zbGF0ZVgoLTUwJSk7YmFja2dyb3VuZDojNkM2M0ZGO2NvbG9yOiNmZmY7cGFkZGluZzo0cHggMTZweDtib3JkZXItcmFkaXVzOjIwcHg7Zm9udC1zaXplOjExcHg7Zm9udC13ZWlnaHQ6NzAwfQogICAgLnByaWNle2ZvbnQtc2l6ZTo0MHB4O2ZvbnQtd2VpZ2h0OjgwMDttYXJnaW46MTJweCAwfS5wcmljZSBzcGFue2ZvbnQtc2l6ZToxNnB4O2NvbG9yOiM4ODg4YWE7Zm9udC13ZWlnaHQ6NDAwfQogICAgLnByaWNlLWNhcmQgdWx7bGlzdC1zdHlsZTpub25lO21hcmdpbi1ib3R0b206MjRweH0ucHJpY2UtY2FyZCB1bCBsaXtjb2xvcjojODg4OGFhO3BhZGRpbmc6NnB4IDA7Zm9udC1zaXplOjE0cHh9CiAgICAucHJpY2UtY2FyZCB1bCBsaTo6YmVmb3Jle2NvbnRlbnQ6J+KckyAnO2NvbG9yOiMwMEU1QTB9CiAgICAuY3Rhe3BhZGRpbmc6ODBweCAyNHB4O3RleHQtYWxpZ246Y2VudGVyO2JhY2tncm91bmQ6bGluZWFyLWdyYWRpZW50KDEzNWRlZyxyZ2JhKDEwOCw5OSwyNTUsMC4wOCkscmdiYSgwLDIyOSwxNjAsMC4wNSkpfQogICAgLmN0YSBoMntmb250LXNpemU6Y2xhbXAoMjhweCw0dncsNDBweCk7bWFyZ2luLWJvdHRvbToxNnB4fQogICAgLmN0YSBwe2NvbG9yOiM4ODg4YWE7bWFyZ2luLWJvdHRvbTozMnB4fQogICAgZm9vdGVye2JvcmRlci10b3A6MXB4IHNvbGlkIHJnYmEoMjU1LDI1NSwyNTUsMC4wNSk7cGFkZGluZzoyNHB4O3RleHQtYWxpZ246Y2VudGVyO2NvbG9yOiM1NTU7Zm9udC1zaXplOjEzcHh9CiAgICBmb290ZXIgYXtjb2xvcjojNkM2M0ZGO3RleHQtZGVjb3JhdGlvbjpub25lfQogICAgQG1lZGlhKG1heC13aWR0aDo3NjhweCl7bmF2e3BhZGRpbmc6MTJweCAxNnB4fS5uYXYtbGlua3N7ZGlzcGxheTpub25lfX0KICA8L3N0eWxlPgo8L2hlYWQ+Cjxib2R5PgogIDxuYXY+CiAgICA8ZGl2IGNsYXNzPSJsb2dvIj48c3BhbiBjbGFzcz0iZ3JhZGllbnQtdGV4dCI+TWVnYW4gQ2hhdDwvc3Bhbj48L2Rpdj4KICAgIDxkaXYgY2xhc3M9Im5hdi1saW5rcyI+CiAgICAgIDxhIGhyZWY9IiNmZWF0dXJlcyI+RmVhdHVyZXM8L2E+CiAgICAgIDxhIGhyZWY9IiNwcmljaW5nIj5QcmljaW5nPC9hPgogICAgICA8YSBocmVmPSJodHRwczovL3d3dy5ucG1qcy5jb20vcGFja2FnZS9tZWdhbi1jaGF0LXNkayI+U0RLPC9hPgogICAgICA8YSBocmVmPSJodHRwczovL2dpdGh1Yi5jb20vVHJhY2tlcldhbmdhL21lZ2FuLWNoYXQiPkdpdEh1YjwvYT4KICAgIDwvZGl2PgogICAgPGEgaHJlZj0iaHR0cHM6Ly93d3cubnBtanMuY29tL3BhY2thZ2UvbWVnYW4tY2hhdC1zZGsiIGNsYXNzPSJidG4gYnRuLXByaW1hcnkiPkdldCBTdGFydGVkPC9hPgogIDwvbmF2PgoKICA8c2VjdGlvbiBjbGFzcz0iaGVybyI+CiAgICA8ZGl2IGNsYXNzPSJoZXJvLWNvbnRlbnQiPgogICAgICA8aDE+QnVpbGQgQ2hhdCBBcHBzIGluIDxzcGFuIGNsYXNzPSJncmFkaWVudC10ZXh0Ij5NaW51dGVzPC9zcGFuPjwvaDE+CiAgICAgIDxwPlRoZSBjb21wbGV0ZSBjaGF0IEFQSSDigJQgbWVzc2FnaW5nLCB2b2ljZSAmIHZpZGVvIGNhbGxzLCBzdG9yaWVzLCBncm91cHMsIEdJRnMsIHN0aWNrZXJzLiBGcmVlIGZvcmV2ZXIuPC9wPgogICAgICA8ZGl2IGNsYXNzPSJoZXJvLWJ1dHRvbnMiPgogICAgICAgIDxhIGhyZWY9Imh0dHBzOi8vd3d3Lm5wbWpzLmNvbS9wYWNrYWdlL21lZ2FuLWNoYXQtc2RrIiBjbGFzcz0iYnRuIGJ0bi1wcmltYXJ5IiBzdHlsZT0icGFkZGluZzoxNHB4IDMycHg7Zm9udC1zaXplOjE2cHgiPm5wbSBpbnN0YWxsIG1lZ2FuLWNoYXQtc2RrPC9hPgogICAgICAgIDxhIGhyZWY9IiNmZWF0dXJlcyIgY2xhc3M9ImJ0biBidG4tb3V0bGluZSIgc3R5bGU9InBhZGRpbmc6MTRweCAzMnB4O2ZvbnQtc2l6ZToxNnB4Ij5WaWV3IEZlYXR1cmVzPC9hPgogICAgICA8L2Rpdj4KICAgICAgPGRpdiBjbGFzcz0iY29kZS1ibG9jayI+CiAgICAgICAgPHByZT48c3BhbiBjbGFzcz0ia3ciPmltcG9ydDwvc3Bhbj4gTWVnYW5DaGF0IDxzcGFuIGNsYXNzPSJrdyI+ZnJvbTwvc3Bhbj4gPHNwYW4gY2xhc3M9InN0ciI+Im1lZ2FuLWNoYXQtc2RrIjwvc3Bhbj47Cgo8c3BhbiBjbGFzcz0ia3ciPmNvbnN0PC9zcGFuPiBjaGF0ID0gPHNwYW4gY2xhc3M9Imt3Ij5uZXc8L3NwYW4+IE1lZ2FuQ2hhdCh7IGFwaUtleTogPHNwYW4gY2xhc3M9InN0ciI+Im1lZ2FuX2NoYXRfeHh4eCI8L3NwYW4+IH0pOwoKPHNwYW4gY2xhc3M9ImNtIj4vLyBTZW5kIG1lc3NhZ2VzPC9zcGFuPgpjaGF0LjxzcGFuIGNsYXNzPSJrdyI+c2VuZE1lc3NhZ2U8L3NwYW4+KDxzcGFuIGNsYXNzPSJzdHIiPiJnZW5lcmFsIjwvc3Bhbj4sIDxzcGFuIGNsYXNzPSJzdHIiPiJIZWxsbyB3b3JsZCEiPC9zcGFuPik7Cgo8c3BhbiBjbGFzcz0iY20iPi8vIE1ha2UgdmlkZW8gY2FsbHM8L3NwYW4+CjxzcGFuIGNsYXNzPSJrdyI+Y29uc3Q8L3NwYW4+IGNhbGwgPSA8c3BhbiBjbGFzcz0ia3ciPmF3YWl0PC9zcGFuPiBjaGF0LjxzcGFuIGNsYXNzPSJrdyI+c3RhcnRDYWxsPC9zcGFuPig8c3BhbiBjbGFzcz0ic3RyIj4idXNlcjQ1NiI8L3NwYW4+KTsKCjxzcGFuIGNsYXNzPSJjbSI+Ly8gUG9zdCBzdG9yaWVzPC9zcGFuPgo8c3BhbiBjbGFzcz0ia3ciPmF3YWl0PC9zcGFuPiBjaGF0LjxzcGFuIGNsYXNzPSJrdyI+cG9zdFN0b3J5PC9zcGFuPih7IHR5cGU6IDxzcGFuIGNsYXNzPSJzdHIiPiJ0ZXh0Ijwvc3Bhbj4sIGNvbnRlbnQ6IDxzcGFuIGNsYXNzPSJzdHIiPiJIZWxsbyEiPC9zcGFuPiB9KTs8L3ByZT4KICAgICAgPC9kaXY+CiAgICA8L2Rpdj4KICA8L3NlY3Rpb24+CgogIDxzZWN0aW9uIGNsYXNzPSJmZWF0dXJlcyIgaWQ9ImZlYXR1cmVzIj4KICAgIDxoMj5FdmVyeXRoaW5nIFlvdSA8c3BhbiBjbGFzcz0iZ3JhZGllbnQtdGV4dCI+TmVlZDwvc3Bhbj48L2gyPgogICAgPHAgY2xhc3M9InN1YnRpdGxlIj44MCsgZW5kcG9pbnRzLiBPbmUgQVBJIGtleS4gSW5maW5pdGUgcG9zc2liaWxpdGllcy48L3A+CiAgICA8ZGl2IGNsYXNzPSJmZWF0dXJlcy1ncmlkIj4KICAgICAgPGRpdiBjbGFzcz0iZmVhdHVyZS1jYXJkIj48ZGl2IGNsYXNzPSJmZWF0dXJlLWljb24iPvCfkqw8L2Rpdj48aDM+UmVhbC10aW1lIE1lc3NhZ2luZzwvaDM+PHA+U2VuZCwgZWRpdCwgZGVsZXRlLCBmb3J3YXJkIG1lc3NhZ2VzIHdpdGggdHlwaW5nIGluZGljYXRvcnMgYW5kIHJlYWQgcmVjZWlwdHMuPC9wPjwvZGl2PgogICAgICA8ZGl2IGNsYXNzPSJmZWF0dXJlLWNhcmQiPjxkaXYgY2xhc3M9ImZlYXR1cmUtaWNvbiI+8J+TuTwvZGl2PjxoMz5Wb2ljZSAmIFZpZGVvIENhbGxzPC9oMz48cD5XZWJSVEMtcG93ZXJlZCBjYWxscyDigJQgMS1vbi0xIG9yIGdyb3VwcyBvZiA1MC4gQ3J5c3RhbCBjbGVhciwgUDJQLCBmcmVlLjwvcD48L2Rpdj4KICAgICAgPGRpdiBjbGFzcz0iZmVhdHVyZS1jYXJkIj48ZGl2IGNsYXNzPSJmZWF0dXJlLWljb24iPvCfk7E8L2Rpdj48aDM+U3RvcmllcyAmIFN0YXR1czwvaDM+PHA+UG9zdCB0ZXh0IG9yIGltYWdlIHN0b3JpZXMgdGhhdCBkaXNhcHBlYXIgYWZ0ZXIgMjQgaG91cnMuPC9wPjwvZGl2PgogICAgICA8ZGl2IGNsYXNzPSJmZWF0dXJlLWNhcmQiPjxkaXYgY2xhc3M9ImZlYXR1cmUtaWNvbiI+8J+RpTwvZGl2PjxoMz5Hcm91cHMgJiBDaGFubmVsczwvaDM+PHA+Q3JlYXRlIHJvb21zLCBpbnZpdGUgdmlhIGxpbmtzLCBtdXRlLCBkaXNhcHBlYXJpbmcgbWVzc2FnZXMuPC9wPjwvZGl2PgogICAgICA8ZGl2IGNsYXNzPSJmZWF0dXJlLWNhcmQiPjxkaXYgY2xhc3M9ImZlYXR1cmUtaWNvbiI+8J+OrzwvZGl2PjxoMz5SZWFjdGlvbnMgJiBQb2xsczwvaDM+PHA+8J+RjeKdpO+4j/CfmIIgb24gYW55IG1lc3NhZ2UuIENyZWF0ZSBwb2xscyB3aXRoIHJlYWwtdGltZSByZXN1bHRzLjwvcD48L2Rpdj4KICAgICAgPGRpdiBjbGFzcz0iZmVhdHVyZS1jYXJkIj48ZGl2IGNsYXNzPSJmZWF0dXJlLWljb24iPvCflJI8L2Rpdj48aDM+UHJpdmFjeSBDb250cm9sczwvaDM+PHA+TGFzdCBzZWVuLCBvbmxpbmUgc3RhdHVzLCByZWFkIHJlY2VpcHRzIOKAlCBhbGwgY29uZmlndXJhYmxlLjwvcD48L2Rpdj4KICAgICAgPGRpdiBjbGFzcz0iZmVhdHVyZS1jYXJkIj48ZGl2IGNsYXNzPSJmZWF0dXJlLWljb24iPvCfjqg8L2Rpdj48aDM+R0lGcyAmIFN0aWNrZXJzPC9oMz48cD5TZWFyY2ggR2lwaHkvVGVub3IuIEJ1aWx0LWluIHN0aWNrZXIgcGFja3MuPC9wPjwvZGl2PgogICAgICA8ZGl2IGNsYXNzPSJmZWF0dXJlLWNhcmQiPjxkaXYgY2xhc3M9ImZlYXR1cmUtaWNvbiI+8J+MkDwvZGl2PjxoMz5NdWx0aS1EZXZpY2UgU3luYzwvaDM+PHA+TGluayBwaG9uZSwgbGFwdG9wLCB0YWJsZXQuIE1lc3NhZ2VzIHN5bmMgYWNyb3NzIGRldmljZXMuPC9wPjwvZGl2PgogICAgPC9kaXY+CiAgPC9zZWN0aW9uPgoKICA8c2VjdGlvbiBjbGFzcz0icHJpY2luZyIgaWQ9InByaWNpbmciPgogICAgPGgyPlNpbXBsZSA8c3BhbiBjbGFzcz0iZ3JhZGllbnQtdGV4dCI+UHJpY2luZzwvc3Bhbj48L2gyPgogICAgPHAgc3R5bGU9ImNvbG9yOiM4ODg4YWEiPlN0YXJ0IGZyZWUsIHBheSB3aXRoIE1HQyBjb2lucyBhcyB5b3UgZ3JvdzwvcD4KICAgIDxkaXYgY2xhc3M9InByaWNpbmctZ3JpZCI+CiAgICAgIDxkaXYgY2xhc3M9InByaWNlLWNhcmQgcG9wdWxhciI+CiAgICAgICAgPGgzPkZyZWU8L2gzPjxkaXYgY2xhc3M9InByaWNlIj4wIDxzcGFuPk1HQzwvc3Bhbj48L2Rpdj4KICAgICAgICA8dWw+PGxpPjEwMCBjb25uZWN0aW9uczwvbGk+PGxpPjEwLDAwMCBtZXNzYWdlcy9tbzwvbGk+PGxpPjEtb24tMSBjYWxsczwvbGk+PGxpPkdyb3VwcyB1cCB0byAxMDwvbGk+PC91bD4KICAgICAgICA8YSBocmVmPSIjIiBjbGFzcz0iYnRuIGJ0bi1wcmltYXJ5IiBzdHlsZT0id2lkdGg6MTAwJSI+U3RhcnQgRnJlZTwvYT4KICAgICAgPC9kaXY+CiAgICAgIDxkaXYgY2xhc3M9InByaWNlLWNhcmQiPgogICAgICAgIDxoMz5Qcm88L2gzPjxkaXYgY2xhc3M9InByaWNlIj41MDAgPHNwYW4+TUdDPC9zcGFuPjwvZGl2PgogICAgICAgIDx1bD48bGk+MSwwMDAgY29ubmVjdGlvbnM8L2xpPjxsaT5VbmxpbWl0ZWQgbWVzc2FnZXM8L2xpPjxsaT5Hcm91cCBjYWxscyAoNTApPC9saT48bGk+U3RvcmllcyAmIEdJRnM8L2xpPjwvdWw+CiAgICAgICAgPGEgaHJlZj0iaHR0cHM6Ly9hcGlzLm1lZ2FuLnF6ei5pby9zaG9wIiBjbGFzcz0iYnRuIGJ0bi1vdXRsaW5lIiBzdHlsZT0id2lkdGg6MTAwJSI+VXBncmFkZTwvYT4KICAgICAgPC9kaXY+CiAgICAgIDxkaXYgY2xhc3M9InByaWNlLWNhcmQiPgogICAgICAgIDxoMz5CdXNpbmVzczwvaDM+PGRpdiBjbGFzcz0icHJpY2UiPjIsMDAwIDxzcGFuPk1HQzwvc3Bhbj48L2Rpdj4KICAgICAgICA8dWw+PGxpPlVubGltaXRlZCBldmVyeXRoaW5nPC9saT48bGk+V2hpdGUgbGFiZWw8L2xpPjxsaT5DdXN0b20gZG9tYWluPC9saT48bGk+RGVkaWNhdGVkIHN1cHBvcnQ8L2xpPjwvdWw+CiAgICAgICAgPGEgaHJlZj0iaHR0cHM6Ly9hcGlzLm1lZ2FuLnF6ei5pby9zaG9wIiBjbGFzcz0iYnRuIGJ0bi1vdXRsaW5lIiBzdHlsZT0id2lkdGg6MTAwJSI+VXBncmFkZTwvYT4KICAgICAgPC9kaXY+CiAgICA8L2Rpdj4KICA8L3NlY3Rpb24+CgogIDxzZWN0aW9uIGNsYXNzPSJjdGEiPgogICAgPGgyPlJlYWR5IHRvIDxzcGFuIGNsYXNzPSJncmFkaWVudC10ZXh0Ij5CdWlsZD88L3NwYW4+PC9oMj4KICAgIDxwPk9uZSBBUEkga2V5LiA4MCsgZW5kcG9pbnRzLiBTdGFydCBidWlsZGluZyB5b3VyIGNoYXQgYXBwIHRvZGF5LjwvcD4KICAgIDxkaXYgc3R5bGU9ImRpc3BsYXk6ZmxleDtnYXA6MTZweDtqdXN0aWZ5LWNvbnRlbnQ6Y2VudGVyO2ZsZXgtd3JhcDp3cmFwIj4KICAgICAgPGEgaHJlZj0iaHR0cHM6Ly93d3cubnBtanMuY29tL3BhY2thZ2UvbWVnYW4tY2hhdC1zZGsiIGNsYXNzPSJidG4gYnRuLXByaW1hcnkiIHN0eWxlPSJwYWRkaW5nOjE2cHggMzZweDtmb250LXNpemU6MTZweCI+bnBtIGluc3RhbGwgbWVnYW4tY2hhdC1zZGs8L2E+CiAgICAgIDxhIGhyZWY9Imh0dHBzOi8vZ2l0aHViLmNvbS9UcmFja2VyV2FuZ2EvbWVnYW4tY2hhdCIgY2xhc3M9ImJ0biBidG4tb3V0bGluZSIgc3R5bGU9InBhZGRpbmc6MTZweCAzNnB4O2ZvbnQtc2l6ZToxNnB4Ij5WaWV3IG9uIEdpdEh1YjwvYT4KICAgIDwvZGl2PgogIDwvc2VjdGlvbj4KCiAgPGZvb3Rlcj4KICAgIDxwPkJ1aWx0IHdpdGgg4p2k77iPIGJ5IDxhIGhyZWY9Imh0dHBzOi8vZ2l0aHViLmNvbS9UcmFja2VyV2FuZ2EiPlRyYWNrZXIgV2FuZ2E8L2E+IOKAoiBGYWxjb24gVGVjaCDCqSAyMDI2PC9wPgogICAgPHAgc3R5bGU9Im1hcmdpbi10b3A6OHB4Ij48YSBocmVmPSJodHRwczovL2FwaXMubWVnYW4ucXp6LmlvIj5NZWdhbiBBUElzPC9hPiDigKIgPGEgaHJlZj0iaHR0cHM6Ly93d3cubnBtanMuY29tL3BhY2thZ2UvbWVnYW4tY2hhdC1zZGsiPm5wbTwvYT48L3A+CiAgPC9mb290ZXI+CjwvYm9keT4KPC9odG1sPgo=");
-        return new Response(html, { headers: {"Content-Type":"text/html"} });
-      }
-
-      if (p === "/" || p === "/health") return Response.json({ 
-    status:"ok", 
-    name:"Megan Chat API v2.0",
-    version:"2.0.0",
-    docs:"https://github.com/TrackerWanga/megan-chat",
-    sdk:"npm install megan-chat-sdk",
-    endpoints:{
-      auth:"/api/auth/register, /api/auth/login",
-      messaging:"WebSocket /ws",
-      calls:"/api/calls/offer, /api/calls/answer",
-      friends:"/api/friends, /api/friends/request",
-      rooms:"/api/rooms",
-      stories:"/api/stories",
-      polls:"/api/polls",
-      gifs:"/api/gifs/search",
-      stickers:"/api/stickers",
-      admin:"/admin/stats?master_key=xxx"
-    },
-    features:["messages","reactions","threads","polls","read-receipts","stickers","search","blocking","scheduled","friends","groups","push-notifications","calls","stories","gifs","location"]["messages","reactions","threads","polls","read-receipts","stickers","search","blocking","scheduled","friends","groups","push-notifications"] }, { headers: cors });
-
-      return Response.json({ error:"Not found" }, { status:404, headers:cors });
+      if (path === "/ws") {
+        const userId = url.searchParams.get("user_id") || dev.uid;
+        const username = url.searchParams.get("username") || dev.username;
+        const roomId = url.searchParams.get("room_id") || "global";
+        const doId = env.CHAT_ROOM.idFromName(roomId);
+        const wsUrl = new URL(request.url);
+        wsUrl.searchParams.set("user_id", userId);
+        wsUrl.searchParams.set("username", username);
+        wsUrl.searchParams.set("room_id", roomId);
+        return env.CHAT_ROOM.get(doId).fetch(new Request(wsUrl.toString(), request));
+      }
+
+      return err("Not found", 404);
     } catch (e: any) {
-      return Response.json({ error: e.message }, { status:500, headers:cors });
+      return err(e.message || "Internal error", 500);
     }
   },
 };
-
-// ═══ DURABLE OBJECT ═══
-
-
-export class ChatRoom {
-  private sessions: Map<string, WebSocket>;
-
-  constructor(state: DurableObjectState) {
-    this.sessions = new Map();
-  }
-
-  async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    
-    // Internal broadcast from REST API
-    if (url.pathname === "/broadcast") {
-      const data = await request.json() as any;
-      this.broadcast(data);
-      return Response.json({ ok: true });
-    }
-
-    // WebSocket connection
-    const pair = new WebSocketPair();
-    const [client, server] = Object.values(pair);
-    const userId = url.searchParams.get("user")||"anonymous";
-    const roomId = url.searchParams.get("room")||"global";
-
-    this.sessions.set(userId, server);
-    server.accept();
-
-    // Send online users
-    server.send(JSON.stringify({ type:"online_users", users:[...this.sessions.keys()], count:this.sessions.size }));
-
-    server.addEventListener("message", async (event) => {
-      const data = JSON.parse(event.data as string);
-      
-      switch (data.type) {
-        case "message":
-          const msg = { type:"message", user:userId, text:data.text, timestamp:Date.now() };
-          this.broadcast(msg);
-          // Save to D1
-          try {
-            await fetch(`${FB_DB}/chats/${roomId}/messages.json?auth=${FB_KEY}`, { method:"POST", body:JSON.stringify({user:userId,text:data.text,timestamp:Date.now()}) });
-          } catch {}
-          break;
-
-        case "sticker":
-          this.broadcast({ type:"sticker", user:userId, stickerId:data.stickerId, stickerUrl:data.stickerUrl, timestamp:Date.now() });
-          break;
-
-        case "typing":
-          this.broadcast({ type:"typing", user:userId, isTyping:data.isTyping }, userId);
-          break;
-
-        case "join":
-          this.broadcast({ type:"user_joined", user:userId, online:this.sessions.size });
-          break;
-      }
-    });
-
-    server.addEventListener("close", () => {
-      this.sessions.delete(userId);
-      this.broadcast({ type:"user_left", user:userId, online:this.sessions.size });
-    });
-
-    return new Response(null, { status:101, webSocket:client });
-  }
-
-  broadcast(message: any, excludeUser?: string) {
-    const data = JSON.stringify(message);
-    for (const [userId, ws] of this.sessions) {
-      if (userId !== excludeUser) {
-        try { ws.send(data); } catch {}
-      }
-    }
-  }
-}
